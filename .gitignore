@@ -1,0 +1,50 @@
+# Anchor
+.anchor
+.DS_Store
+target
+**/*.rs.bk
+node_modules
+test-ledger
+.yarn
+
+# Build artifacts
+/target/
+**/.anchor/
+
+# IDL
+# Uncomment if you want to ignore generated IDL files
+# target/idl/
+# target/types/
+
+# Keys - IMPORTANT: Never commit private keys
+**/id.json
+**/*-keypair.json
+**/deploy/
+
+# Solana
+/dist/
+test-ledger/
+
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+.pnp
+.pnp.js
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/

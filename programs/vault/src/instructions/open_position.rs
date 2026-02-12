@@ -1,0 +1,205 @@
+use anchor_lang::prelude::*;
+use anchor_spl::associated_token::AssociatedToken;
+use anchor_spl::token::Token;
+use anchor_spl::token_2022::Token2022;
+use anchor_spl::token_interface::{Mint, TokenAccount};
+use raydium_clmm_cpi::{
+    cpi,
+    states::PoolState,
+};
+
+use crate::errors::VaultError;
+use crate::state::{seeds, Vault};
+
+#[derive(Accounts)]
+#[instruction(tick_lower_index: i32, tick_upper_index: i32, tick_array_lower_start_index: i32, tick_array_upper_start_index: i32)]
+pub struct OpenPosition<'info> {
+    /// Admin opening the position
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    /// Vault state
+    #[account(
+        mut,
+        seeds = [seeds::VAULT],
+        bump = vault.bump,
+        constraint = vault.admin == admin.key() @ VaultError::Unauthorized,
+        constraint = !vault.has_active_position @ VaultError::PositionAlreadyExists,
+    )]
+    pub vault: Box<Account<'info, Vault>>,
+
+    /// SOL treasury PDA (source for token0)
+    #[account(
+        mut,
+        seeds = [seeds::SOL_TREASURY, vault.key().as_ref()],
+        bump = vault.sol_treasury_bump,
+    )]
+    pub sol_treasury: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// USDC treasury PDA (source for token1)
+    #[account(
+        mut,
+        seeds = [seeds::USDC_TREASURY, vault.key().as_ref()],
+        bump = vault.usdc_treasury_bump,
+    )]
+    pub usdc_treasury: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    // ============ Raydium CLMM accounts ============
+
+    /// Pool state
+    #[account(mut)]
+    pub pool_state: AccountLoader<'info, PoolState>,
+
+    /// Position NFT mint (will be created)
+    #[account(mut)]
+    pub position_nft_mint: Signer<'info>,
+
+    /// Position NFT account (vault will own the NFT)
+    /// CHECK: Will be initialized by Raydium
+    #[account(mut)]
+    pub position_nft_account: UncheckedAccount<'info>,
+
+    /// Personal position state (created by Raydium)
+    /// CHECK: Will be initialized by Raydium
+    #[account(mut)]
+    pub personal_position: UncheckedAccount<'info>,
+
+    /// Tick array for lower bound
+    /// CHECK: Validated by Raydium
+    #[account(mut)]
+    pub tick_array_lower: UncheckedAccount<'info>,
+
+    /// Tick array for upper bound
+    /// CHECK: Validated by Raydium
+    #[account(mut)]
+    pub tick_array_upper: UncheckedAccount<'info>,
+
+    /// Token vault 0 (pool's SOL vault)
+    #[account(mut)]
+    pub token_vault_0: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// Token vault 1 (pool's USDC vault)
+    #[account(mut)]
+    pub token_vault_1: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// Mint of vault 0
+    pub vault_0_mint: Box<InterfaceAccount<'info, Mint>>,
+
+    /// Mint of vault 1
+    pub vault_1_mint: Box<InterfaceAccount<'info, Mint>>,
+
+    /// Tick array bitmap extension
+    /// CHECK: Validated by Raydium
+    pub tick_array_bitmap: UncheckedAccount<'info>,
+
+    pub rent: Sysvar<'info, Rent>,
+    pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+    pub token_program_2022: Program<'info, Token2022>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+}
+
+pub fn handler<'a, 'b, 'c: 'info, 'info>(
+    ctx: Context<'a, 'b, 'c, 'info, OpenPosition<'info>>,
+    tick_lower_index: i32,
+    tick_upper_index: i32,
+    tick_array_lower_start_index: i32,
+    tick_array_upper_start_index: i32,
+    liquidity: u128,
+    amount_0_max: u64,
+    amount_1_max: u64,
+) -> Result<()> {
+    require!(liquidity > 0 || amount_0_max > 0, VaultError::InvalidAmount);
+
+    let vault = &ctx.accounts.vault;
+
+    // Check treasury has enough funds
+    require!(
+        ctx.accounts.sol_treasury.amount >= amount_0_max,
+        VaultError::InsufficientTreasuryBalance
+    );
+    require!(
+        ctx.accounts.usdc_treasury.amount >= amount_1_max,
+        VaultError::InsufficientTreasuryBalance
+    );
+
+    // Build signer seeds for vault PDA (will own the position)
+    let vault_seeds: &[&[&[u8]]] = &[&[
+        seeds::VAULT,
+        &[vault.bump],
+    ]];
+
+    // Build CPI context for opening position
+    let cpi_accounts = cpi::accounts::OpenPositionWithToken22Nft {
+        payer: ctx.accounts.admin.to_account_info(),
+        position_nft_owner: ctx.accounts.vault.to_account_info(), // Vault owns the NFT
+        position_nft_mint: ctx.accounts.position_nft_mint.to_account_info(),
+        position_nft_account: ctx.accounts.position_nft_account.to_account_info(),
+        pool_state: ctx.accounts.pool_state.to_account_info(),
+        protocol_position: ctx.accounts.personal_position.to_account_info(),
+        tick_array_lower: ctx.accounts.tick_array_lower.to_account_info(),
+        tick_array_upper: ctx.accounts.tick_array_upper.to_account_info(),
+        personal_position: ctx.accounts.personal_position.to_account_info(),
+        token_account_0: ctx.accounts.sol_treasury.to_account_info(),
+        token_account_1: ctx.accounts.usdc_treasury.to_account_info(),
+        token_vault_0: ctx.accounts.token_vault_0.to_account_info(),
+        token_vault_1: ctx.accounts.token_vault_1.to_account_info(),
+        rent: ctx.accounts.rent.to_account_info(),
+        system_program: ctx.accounts.system_program.to_account_info(),
+        token_program: ctx.accounts.token_program.to_account_info(),
+        associated_token_program: ctx.accounts.associated_token_program.to_account_info(),
+        token_program_2022: ctx.accounts.token_program_2022.to_account_info(),
+        vault_0_mint: ctx.accounts.vault_0_mint.to_account_info(),
+        vault_1_mint: ctx.accounts.vault_1_mint.to_account_info(),
+    };
+
+    let cpi_ctx = CpiContext::new_with_signer(
+        ctx.accounts.pool_state.to_account_info(),
+        cpi_accounts,
+        vault_seeds,
+    );
+
+    // Add remaining accounts (tick array bitmap)
+    let cpi_ctx = cpi_ctx.with_remaining_accounts(vec![
+        ctx.accounts.tick_array_bitmap.to_account_info(),
+    ]);
+
+    // Execute CPI to open position
+    cpi::open_position_with_token22_nft(
+        cpi_ctx,
+        tick_lower_index,
+        tick_upper_index,
+        tick_array_lower_start_index,
+        tick_array_upper_start_index,
+        liquidity,
+        amount_0_max,
+        amount_1_max,
+        true, // with_metadata
+        Some(true), // base_flag: calculate from amount_0
+    )?;
+
+    // Reload treasuries to get updated balances
+    ctx.accounts.sol_treasury.reload()?;
+    ctx.accounts.usdc_treasury.reload()?;
+
+    // Update vault state
+    let vault = &mut ctx.accounts.vault;
+    vault.has_active_position = true;
+    vault.position_mint = ctx.accounts.position_nft_mint.key();
+    vault.position_pool_id = ctx.accounts.pool_state.key();
+    vault.position_tick_lower = tick_lower_index;
+    vault.position_tick_upper = tick_upper_index;
+    vault.position_liquidity = liquidity;
+    vault.position_sol = amount_0_max.saturating_sub(ctx.accounts.sol_treasury.amount);
+    vault.position_usdc = amount_1_max.saturating_sub(ctx.accounts.usdc_treasury.amount);
+    vault.treasury_sol = ctx.accounts.sol_treasury.amount;
+    vault.treasury_usdc = ctx.accounts.usdc_treasury.amount;
+
+    msg!("Position opened: {}", ctx.accounts.position_nft_mint.key());
+    msg!("Tick range: {} - {}", tick_lower_index, tick_upper_index);
+    msg!("Liquidity: {}", liquidity);
+    msg!("SOL used: {}", vault.position_sol);
+    msg!("USDC used: {}", vault.position_usdc);
+
+    Ok(())
+}
