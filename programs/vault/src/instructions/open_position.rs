@@ -92,6 +92,11 @@ pub struct OpenPosition<'info> {
     /// CHECK: Validated by Raydium
     pub tick_array_bitmap: UncheckedAccount<'info>,
 
+    /// Raydium CLMM program
+    /// CHECK: Validated by address constraint
+    #[account(address = raydium_clmm_cpi::id())]
+    pub clmm_program: UncheckedAccount<'info>,
+
     pub rent: Sysvar<'info, Rent>,
     pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
@@ -123,13 +128,51 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
         VaultError::InsufficientTreasuryBalance
     );
 
-    // Build signer seeds for vault PDA (will own the position)
+    // Build signer seeds for vault PDA
     let vault_seeds: &[&[&[u8]]] = &[&[
         seeds::VAULT,
         &[vault.bump],
     ]];
 
+    // Approve admin as delegate on treasury accounts so Raydium can use admin (payer) as authority
+    let sol_treasury_seeds: &[&[u8]] = &[
+        seeds::SOL_TREASURY,
+        &ctx.accounts.vault.key().to_bytes(),
+        &[vault.sol_treasury_bump],
+    ];
+    anchor_spl::token_interface::approve(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            anchor_spl::token_interface::Approve {
+                to: ctx.accounts.sol_treasury.to_account_info(),
+                delegate: ctx.accounts.admin.to_account_info(),
+                authority: ctx.accounts.sol_treasury.to_account_info(),
+            },
+            &[sol_treasury_seeds],
+        ),
+        amount_0_max,
+    )?;
+
+    let usdc_treasury_seeds: &[&[u8]] = &[
+        seeds::USDC_TREASURY,
+        &ctx.accounts.vault.key().to_bytes(),
+        &[vault.usdc_treasury_bump],
+    ];
+    anchor_spl::token_interface::approve(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            anchor_spl::token_interface::Approve {
+                to: ctx.accounts.usdc_treasury.to_account_info(),
+                delegate: ctx.accounts.admin.to_account_info(),
+                authority: ctx.accounts.usdc_treasury.to_account_info(),
+            },
+            &[usdc_treasury_seeds],
+        ),
+        amount_1_max,
+    )?;
+
     // Build CPI context for opening position
+    // Admin is payer (for rent), vault owns the NFT, admin is delegated authority on treasuries
     let cpi_accounts = cpi::accounts::OpenPositionWithToken22Nft {
         payer: ctx.accounts.admin.to_account_info(),
         position_nft_owner: ctx.accounts.vault.to_account_info(), // Vault owns the NFT
@@ -154,7 +197,7 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     };
 
     let cpi_ctx = CpiContext::new_with_signer(
-        ctx.accounts.pool_state.to_account_info(),
+        ctx.accounts.clmm_program.to_account_info(),
         cpi_accounts,
         vault_seeds,
     );

@@ -78,6 +78,11 @@ pub struct SwapInTreasury<'info> {
     /// Output vault mint
     pub output_vault_mint: Box<InterfaceAccount<'info, Mint>>,
 
+    /// Raydium CLMM program
+    /// CHECK: Validated by address constraint
+    #[account(address = raydium_clmm_cpi::id())]
+    pub clmm_program: UncheckedAccount<'info>,
+
     /// Token program
     pub token_program: Program<'info, Token>,
 
@@ -147,7 +152,7 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     };
 
     let cpi_ctx = CpiContext::new_with_signer(
-        ctx.accounts.pool_state.to_account_info(), // CLMM program will be derived from pool_state
+        ctx.accounts.clmm_program.to_account_info(),
         cpi_accounts,
         signer_seeds,
     );

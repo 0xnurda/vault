@@ -21,7 +21,7 @@ anchor-lang = { version = "0.31.1", features = ["init-if-needed"] }
 anchor-spl = "0.31.1"
 
 # Raydium CLMM CPI for swaps (branch for anchor 0.31.1)
-raydium-clmm-cpi = { git = "https://github.com/raydium-io/raydium-cpi", branch = "anchor-0.31.1", package = "raydium-clmm-cpi" }
+raydium-clmm-cpi = { git = "https://github.com/raydium-io/raydium-cpi", branch = "anchor-0.31.1", package = "raydium-clmm-cpi", features = ["devnet"] }
 
 # Pin versions to avoid incompatibility with Solana platform-tools rustc 1.75
 blake3 = "=1.5.5"

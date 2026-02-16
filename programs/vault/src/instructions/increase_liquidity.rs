@@ -84,6 +84,11 @@ pub struct IncreaseLiquidity<'info> {
     /// Mint of vault 1
     pub vault_1_mint: Box<InterfaceAccount<'info, Mint>>,
 
+    /// Raydium CLMM program
+    /// CHECK: Validated by address constraint
+    #[account(address = raydium_clmm_cpi::id())]
+    pub clmm_program: UncheckedAccount<'info>,
+
     pub token_program: Program<'info, Token>,
     pub token_program_2022: Program<'info, Token2022>,
 }
@@ -134,7 +139,7 @@ pub fn handler(
     };
 
     let cpi_ctx = CpiContext::new_with_signer(
-        ctx.accounts.pool_state.to_account_info(),
+        ctx.accounts.clmm_program.to_account_info(),
         cpi_accounts,
         vault_seeds,
     );
