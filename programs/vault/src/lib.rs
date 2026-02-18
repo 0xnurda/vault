@@ -19,6 +19,11 @@ pub mod vault {
         instructions::initialize::handler(ctx)
     }
 
+    /// Pause or unpause the vault
+    pub fn set_paused(ctx: Context<SetPaused>, paused: bool) -> Result<()> {
+        instructions::set_paused::handler(ctx, paused)
+    }
+
     /// Update TVL (called by backend periodically)
     pub fn update_tvl(ctx: Context<UpdateTvl>, tvl_usd: u64, sol_price: u64) -> Result<()> {
         instructions::update_tvl::handler(ctx, tvl_usd, sol_price)
@@ -79,8 +84,8 @@ pub mod vault {
     }
 
     /// Close the active CLMM position and return funds to treasury
-    pub fn close_position(ctx: Context<ClosePosition>) -> Result<()> {
-        instructions::close_position::handler(ctx)
+    pub fn close_position(ctx: Context<ClosePosition>, amount_0_min: u64, amount_1_min: u64) -> Result<()> {
+        instructions::close_position::handler(ctx, amount_0_min, amount_1_min)
     }
 
     /// Increase liquidity in the active position

@@ -11,6 +11,7 @@ pub mod close_position;
 pub mod increase_liquidity;
 pub mod decrease_liquidity;
 pub mod collect_fees;
+pub mod set_paused;
 
 pub use initialize::*;
 pub use update_tvl::*;
@@ -25,3 +26,4 @@ pub use close_position::*;
 pub use increase_liquidity::*;
 pub use decrease_liquidity::*;
 pub use collect_fees::*;
+pub use set_paused::*;

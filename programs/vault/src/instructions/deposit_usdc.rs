@@ -73,6 +73,9 @@ pub fn handler(ctx: Context<DepositUsdc>, amount: u64) -> Result<()> {
     let vault = &mut ctx.accounts.vault;
     let user_deposit = &mut ctx.accounts.user_deposit;
 
+    // M-01: Check pause
+    require!(!vault.is_paused, VaultError::VaultPaused);
+
     // Check TVL is recent (within 10 minutes)
     let current_time = Clock::get()?.unix_timestamp;
     require!(
@@ -118,9 +121,12 @@ pub fn handler(ctx: Context<DepositUsdc>, amount: u64) -> Result<()> {
     token::mint_to(cpi_ctx, shares_to_mint)?;
 
     // Update vault state
-    vault.treasury_usdc = vault.treasury_usdc.checked_add(amount).unwrap();
-    vault.total_shares = vault.total_shares.checked_add(shares_to_mint).unwrap();
-    vault.tvl_usd = vault.tvl_usd.checked_add(deposit_value_usd).unwrap();
+    vault.treasury_usdc = vault.treasury_usdc.checked_add(amount)
+        .ok_or(error!(VaultError::MathOverflow))?;
+    vault.total_shares = vault.total_shares.checked_add(shares_to_mint)
+        .ok_or(error!(VaultError::MathOverflow))?;
+    vault.tvl_usd = vault.tvl_usd.checked_add(deposit_value_usd)
+        .ok_or(error!(VaultError::MathOverflow))?;
 
     // Update user deposit record
     if user_deposit.created_at == 0 {
@@ -129,11 +135,12 @@ pub fn handler(ctx: Context<DepositUsdc>, amount: u64) -> Result<()> {
         user_deposit.created_at = current_time;
         user_deposit.bump = ctx.bumps.user_deposit;
     }
-    user_deposit.shares = user_deposit.shares.checked_add(shares_to_mint).unwrap();
+    user_deposit.shares = user_deposit.shares.checked_add(shares_to_mint)
+        .ok_or(error!(VaultError::MathOverflow))?;
     user_deposit.total_deposited_usdc = user_deposit
         .total_deposited_usdc
         .checked_add(amount)
-        .unwrap();
+        .ok_or(error!(VaultError::MathOverflow))?;
     user_deposit.updated_at = current_time;
 
     msg!("Deposited {} USDC (${} USD)", amount, deposit_value_usd);

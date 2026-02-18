@@ -134,6 +134,10 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
         &[vault.bump],
     ]];
 
+    // H-04: Save balances before CPI for accurate position tracking
+    let sol_before = ctx.accounts.sol_treasury.amount;
+    let usdc_before = ctx.accounts.usdc_treasury.amount;
+
     // Approve admin as delegate on treasury accounts so Raydium can use admin (payer) as authority
     let sol_treasury_seeds: &[&[u8]] = &[
         seeds::SOL_TREASURY,
@@ -221,9 +225,35 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
         Some(true), // base_flag: calculate from amount_0
     )?;
 
+    // H-05: Revoke delegations after CPI
+    anchor_spl::token_interface::revoke(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            anchor_spl::token_interface::Revoke {
+                source: ctx.accounts.sol_treasury.to_account_info(),
+                authority: ctx.accounts.sol_treasury.to_account_info(),
+            },
+            &[sol_treasury_seeds],
+        ),
+    )?;
+    anchor_spl::token_interface::revoke(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            anchor_spl::token_interface::Revoke {
+                source: ctx.accounts.usdc_treasury.to_account_info(),
+                authority: ctx.accounts.usdc_treasury.to_account_info(),
+            },
+            &[usdc_treasury_seeds],
+        ),
+    )?;
+
     // Reload treasuries to get updated balances
     ctx.accounts.sol_treasury.reload()?;
     ctx.accounts.usdc_treasury.reload()?;
+
+    // H-04: Calculate actual amounts used (before - after)
+    let sol_used = sol_before.saturating_sub(ctx.accounts.sol_treasury.amount);
+    let usdc_used = usdc_before.saturating_sub(ctx.accounts.usdc_treasury.amount);
 
     // Update vault state
     let vault = &mut ctx.accounts.vault;
@@ -233,8 +263,8 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     vault.position_tick_lower = tick_lower_index;
     vault.position_tick_upper = tick_upper_index;
     vault.position_liquidity = liquidity;
-    vault.position_sol = amount_0_max.saturating_sub(ctx.accounts.sol_treasury.amount);
-    vault.position_usdc = amount_1_max.saturating_sub(ctx.accounts.usdc_treasury.amount);
+    vault.position_sol = sol_used;
+    vault.position_usdc = usdc_used;
     vault.treasury_sol = ctx.accounts.sol_treasury.amount;
     vault.treasury_usdc = ctx.accounts.usdc_treasury.amount;
 

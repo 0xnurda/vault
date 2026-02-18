@@ -72,6 +72,9 @@ pub struct Vault {
 
     /// Pool ID for the position
     pub position_pool_id: Pubkey,
+
+    /// Whether the vault is paused (deposits/withdrawals disabled)
+    pub is_paused: bool,
 }
 
 impl Vault {
@@ -99,32 +102,30 @@ impl Vault {
         4 +  // position_tick_lower (i32)
         4 +  // position_tick_upper (i32)
         32 + // position_pool_id
-        64;  // padding for future fields
+        1 +  // is_paused
+        63;  // padding for future fields
 
     /// Calculate share price: TVL / total_shares (with 6 decimal precision)
     pub fn share_price(&self) -> u64 {
         if self.total_shares == 0 {
             return 1_000_000; // 1 USD = 1 share initially
         }
-        // share_price = tvl_usd / total_shares
-        self.tvl_usd
+        (self.tvl_usd as u128)
             .checked_mul(1_000_000)
-            .unwrap()
-            .checked_div(self.total_shares)
+            .and_then(|v| v.checked_div(self.total_shares as u128))
+            .and_then(|v| u64::try_from(v).ok())
             .unwrap_or(1_000_000)
     }
 
     /// Calculate shares to mint for a deposit value in USD
     pub fn calculate_shares_to_mint(&self, deposit_value_usd: u64) -> u64 {
         if self.total_shares == 0 {
-            // First deposit: 1 USD = 1 share
             return deposit_value_usd;
         }
-        // shares = deposit_value * total_shares / tvl
-        deposit_value_usd
-            .checked_mul(self.total_shares)
-            .unwrap()
-            .checked_div(self.tvl_usd)
+        (deposit_value_usd as u128)
+            .checked_mul(self.total_shares as u128)
+            .and_then(|v| v.checked_div(self.tvl_usd as u128))
+            .and_then(|v| u64::try_from(v).ok())
             .unwrap_or(0)
     }
 
@@ -133,31 +134,28 @@ impl Vault {
         if self.total_shares == 0 {
             return 0;
         }
-        // value = shares * tvl / total_shares
-        shares
-            .checked_mul(self.tvl_usd)
-            .unwrap()
-            .checked_div(self.total_shares)
+        (shares as u128)
+            .checked_mul(self.tvl_usd as u128)
+            .and_then(|v| v.checked_div(self.total_shares as u128))
+            .and_then(|v| u64::try_from(v).ok())
             .unwrap_or(0)
     }
 
     /// Convert SOL amount (lamports) to USD value (6 decimals)
     pub fn sol_to_usd(&self, lamports: u64) -> u64 {
-        // lamports * sol_price / 10^9 (SOL has 9 decimals)
-        lamports
-            .checked_mul(self.sol_price_usd)
-            .unwrap()
-            .checked_div(1_000_000_000)
+        (lamports as u128)
+            .checked_mul(self.sol_price_usd as u128)
+            .and_then(|v| v.checked_div(1_000_000_000))
+            .and_then(|v| u64::try_from(v).ok())
             .unwrap_or(0)
     }
 
     /// Convert USD value to SOL amount (lamports)
     pub fn usd_to_sol(&self, usd_value: u64) -> u64 {
-        // usd_value * 10^9 / sol_price
-        usd_value
+        (usd_value as u128)
             .checked_mul(1_000_000_000)
-            .unwrap()
-            .checked_div(self.sol_price_usd)
+            .and_then(|v| v.checked_div(self.sol_price_usd as u128))
+            .and_then(|v| u64::try_from(v).ok())
             .unwrap_or(0)
     }
 }

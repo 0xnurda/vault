@@ -63,6 +63,7 @@ pub struct Withdraw<'info> {
     #[account(
         mut,
         constraint = user_wsol_account.owner == user.key(),
+        constraint = user_wsol_account.mint == sol_treasury.mint @ VaultError::InvalidMint,
     )]
     pub user_wsol_account: Box<Account<'info, TokenAccount>>,
 
@@ -70,6 +71,7 @@ pub struct Withdraw<'info> {
     #[account(
         mut,
         constraint = user_usdc_account.owner == user.key(),
+        constraint = user_usdc_account.mint == usdc_treasury.mint @ VaultError::InvalidMint,
     )]
     pub user_usdc_account: Box<Account<'info, TokenAccount>>,
 
@@ -81,6 +83,16 @@ pub fn handler(ctx: Context<Withdraw>, shares_amount: u64) -> Result<()> {
 
     let vault = &mut ctx.accounts.vault;
     let user_deposit = &mut ctx.accounts.user_deposit;
+
+    // M-01: Check pause
+    require!(!vault.is_paused, VaultError::VaultPaused);
+
+    // H-01: Check TVL freshness
+    let current_time = Clock::get()?.unix_timestamp;
+    require!(
+        current_time - vault.last_tvl_update < 600,
+        VaultError::StaleTvl
+    );
 
     // Check user has enough shares
     require!(
@@ -95,34 +107,33 @@ pub fn handler(ctx: Context<Withdraw>, shares_amount: u64) -> Result<()> {
     // Calculate withdrawal value in USD
     let withdrawal_value_usd = vault.calculate_withdrawal_value(shares_amount);
 
-    // Calculate proportional SOL and USDC amounts from treasury
-    // user_ratio = shares_amount / total_shares
+    // H-03: Use actual on-chain balances instead of state
+    let actual_sol = ctx.accounts.sol_treasury.amount;
+    let actual_usdc = ctx.accounts.usdc_treasury.amount;
+
+    // C-01: Use u128 for intermediate math to prevent overflow
     let user_ratio_num = shares_amount;
     let user_ratio_den = vault.total_shares;
 
-    // SOL to withdraw = treasury_sol * user_ratio
-    let sol_to_withdraw = vault
-        .treasury_sol
-        .checked_mul(user_ratio_num)
-        .unwrap()
-        .checked_div(user_ratio_den)
-        .unwrap_or(0);
+    let sol_to_withdraw = (actual_sol as u128)
+        .checked_mul(user_ratio_num as u128)
+        .and_then(|v| v.checked_div(user_ratio_den as u128))
+        .and_then(|v| u64::try_from(v).ok())
+        .ok_or(error!(VaultError::MathOverflow))?;
 
-    // USDC to withdraw = treasury_usdc * user_ratio
-    let usdc_to_withdraw = vault
-        .treasury_usdc
-        .checked_mul(user_ratio_num)
-        .unwrap()
-        .checked_div(user_ratio_den)
-        .unwrap_or(0);
+    let usdc_to_withdraw = (actual_usdc as u128)
+        .checked_mul(user_ratio_num as u128)
+        .and_then(|v| v.checked_div(user_ratio_den as u128))
+        .and_then(|v| u64::try_from(v).ok())
+        .ok_or(error!(VaultError::MathOverflow))?;
 
     // Check treasury has enough
     require!(
-        sol_to_withdraw <= ctx.accounts.sol_treasury.amount,
+        sol_to_withdraw <= actual_sol,
         VaultError::WithdrawalExceedsTreasury
     );
     require!(
-        usdc_to_withdraw <= ctx.accounts.usdc_treasury.amount,
+        usdc_to_withdraw <= actual_usdc,
         VaultError::WithdrawalExceedsTreasury
     );
 
@@ -181,19 +192,23 @@ pub fn handler(ctx: Context<Withdraw>, shares_amount: u64) -> Result<()> {
         token::transfer(cpi_ctx, usdc_to_withdraw)?;
     }
 
-    // Update vault state
-    vault.treasury_sol = vault.treasury_sol.checked_sub(sol_to_withdraw).unwrap();
-    vault.treasury_usdc = vault.treasury_usdc.checked_sub(usdc_to_withdraw).unwrap();
-    vault.total_shares = vault.total_shares.checked_sub(shares_amount).unwrap();
+    // Update vault state — M-03: proper error handling
+    vault.treasury_sol = vault.treasury_sol.saturating_sub(sol_to_withdraw);
+    vault.treasury_usdc = vault.treasury_usdc.saturating_sub(usdc_to_withdraw);
+    vault.total_shares = vault.total_shares
+        .checked_sub(shares_amount)
+        .ok_or(error!(VaultError::MathOverflow))?;
     vault.tvl_usd = vault.tvl_usd.saturating_sub(withdrawal_value_usd);
 
     // Update user deposit record
-    user_deposit.shares = user_deposit.shares.checked_sub(shares_amount).unwrap();
+    user_deposit.shares = user_deposit.shares
+        .checked_sub(shares_amount)
+        .ok_or(error!(VaultError::MathOverflow))?;
     user_deposit.total_withdrawn_usd = user_deposit
         .total_withdrawn_usd
         .checked_add(withdrawal_value_usd)
-        .unwrap();
-    user_deposit.updated_at = Clock::get()?.unix_timestamp;
+        .ok_or(error!(VaultError::MathOverflow))?;
+    user_deposit.updated_at = current_time;
 
     msg!("Burned {} shares", shares_amount);
     msg!("Withdrawn {} lamports SOL", sol_to_withdraw);

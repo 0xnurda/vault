@@ -43,4 +43,7 @@ pub enum VaultError {
 
     #[msg("Invalid position")]
     InvalidPosition,
+
+    #[msg("TVL change exceeds 20% limit per update")]
+    TvlChangeExceeded,
 }

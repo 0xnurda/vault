@@ -103,7 +103,7 @@ pub struct ClosePosition<'info> {
     pub system_program: Program<'info, System>,
 }
 
-pub fn handler(ctx: Context<ClosePosition>) -> Result<()> {
+pub fn handler(ctx: Context<ClosePosition>, amount_0_min: u64, amount_1_min: u64) -> Result<()> {
     let vault = &ctx.accounts.vault;
     let liquidity = vault.position_liquidity;
 
@@ -141,8 +141,8 @@ pub fn handler(ctx: Context<ClosePosition>) -> Result<()> {
         vault_seeds,
     );
 
-    // Decrease all liquidity with 0 minimum (accept any amount)
-    cpi::decrease_liquidity_v2(decrease_ctx, liquidity, 0, 0)?;
+    // H-02: Use slippage params instead of 0
+    cpi::decrease_liquidity_v2(decrease_ctx, liquidity, amount_0_min, amount_1_min)?;
 
     // Then close the position
     let close_accounts = cpi::accounts::ClosePosition {

@@ -113,6 +113,10 @@ pub fn handler(
         VaultError::InsufficientTreasuryBalance
     );
 
+    // M-06: Save balances before CPI for accurate calculation
+    let sol_before = ctx.accounts.sol_treasury.amount;
+    let usdc_before = ctx.accounts.usdc_treasury.amount;
+
     // Build signer seeds for vault PDA
     let vault_seeds: &[&[&[u8]]] = &[&[
         seeds::VAULT,
@@ -152,15 +156,19 @@ pub fn handler(
     ctx.accounts.sol_treasury.reload()?;
     ctx.accounts.usdc_treasury.reload()?;
 
-    // Calculate amounts used
-    let sol_used = amount_0_max.saturating_sub(ctx.accounts.sol_treasury.amount);
-    let usdc_used = amount_1_max.saturating_sub(ctx.accounts.usdc_treasury.amount);
+    // M-06: Calculate actual amounts used (before - after)
+    let sol_used = sol_before.saturating_sub(ctx.accounts.sol_treasury.amount);
+    let usdc_used = usdc_before.saturating_sub(ctx.accounts.usdc_treasury.amount);
+
+    // M-05: Read actual liquidity from personal_position after CPI
+    ctx.accounts.personal_position.reload()?;
+    let actual_liquidity = ctx.accounts.personal_position.liquidity;
 
     // Update vault state
     let vault = &mut ctx.accounts.vault;
-    vault.position_liquidity = vault.position_liquidity.checked_add(liquidity).unwrap_or(vault.position_liquidity);
-    vault.position_sol = vault.position_sol.checked_add(sol_used).unwrap_or(vault.position_sol);
-    vault.position_usdc = vault.position_usdc.checked_add(usdc_used).unwrap_or(vault.position_usdc);
+    vault.position_liquidity = actual_liquidity;
+    vault.position_sol = vault.position_sol.saturating_add(sol_used);
+    vault.position_usdc = vault.position_usdc.saturating_add(usdc_used);
     vault.treasury_sol = ctx.accounts.sol_treasury.amount;
     vault.treasury_usdc = ctx.accounts.usdc_treasury.amount;
 
