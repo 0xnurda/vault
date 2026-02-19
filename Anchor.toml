@@ -7,12 +7,15 @@ skip-lint = false
 
 [programs.localnet]
 vault = "6wktAqahNmWdF14B4UQYam7bskj1fUcMQQXaE2jmTYNz"
+smart_wallet = "CikLi2FgfnAoDDepVRe8WA7SsEHvpaJeZv5WpbvvQKCw"
 
 [programs.devnet]
 vault = "6wktAqahNmWdF14B4UQYam7bskj1fUcMQQXaE2jmTYNz"
+smart_wallet = "CikLi2FgfnAoDDepVRe8WA7SsEHvpaJeZv5WpbvvQKCw"
 
 [programs.mainnet]
 vault = "6wktAqahNmWdF14B4UQYam7bskj1fUcMQQXaE2jmTYNz"
+smart_wallet = "CikLi2FgfnAoDDepVRe8WA7SsEHvpaJeZv5WpbvvQKCw"
 
 [registry]
 url = "https://api.apr.dev"
