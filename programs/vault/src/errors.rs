@@ -29,9 +29,6 @@ pub enum VaultError {
     #[msg("Withdrawal amount exceeds available treasury")]
     WithdrawalExceedsTreasury,
 
-    #[msg("Minimum deposit not met")]
-    MinimumDepositNotMet,
-
     #[msg("Invalid SOL price")]
     InvalidSolPrice,
 
@@ -46,4 +43,7 @@ pub enum VaultError {
 
     #[msg("TVL change exceeds 20% limit per update")]
     TvlChangeExceeded,
+
+    #[msg("No pending admin transfer")]
+    NoPendingAdmin,
 }

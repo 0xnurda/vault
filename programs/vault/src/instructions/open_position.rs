@@ -5,10 +5,11 @@ use anchor_spl::token_2022::Token2022;
 use anchor_spl::token_interface::{Mint, TokenAccount};
 use raydium_clmm_cpi::{
     cpi,
-    states::PoolState,
+    states::{PersonalPositionState, PoolState},
 };
 
 use crate::errors::VaultError;
+use crate::events::PositionOpened;
 use crate::state::{seeds, Vault};
 
 #[derive(Accounts)]
@@ -262,17 +263,24 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     vault.position_pool_id = ctx.accounts.pool_state.key();
     vault.position_tick_lower = tick_lower_index;
     vault.position_tick_upper = tick_upper_index;
-    vault.position_liquidity = liquidity;
+    // M-07: Read actual liquidity from personal_position after CPI (not the requested value)
+    let position_data = ctx.accounts.personal_position.try_borrow_data()?;
+    let personal_pos = PersonalPositionState::try_deserialize(&mut &position_data[..])?;
+    vault.position_liquidity = personal_pos.liquidity;
     vault.position_sol = sol_used;
     vault.position_usdc = usdc_used;
     vault.treasury_sol = ctx.accounts.sol_treasury.amount;
     vault.treasury_usdc = ctx.accounts.usdc_treasury.amount;
 
-    msg!("Position opened: {}", ctx.accounts.position_nft_mint.key());
-    msg!("Tick range: {} - {}", tick_lower_index, tick_upper_index);
-    msg!("Liquidity: {}", liquidity);
-    msg!("SOL used: {}", vault.position_sol);
-    msg!("USDC used: {}", vault.position_usdc);
+    emit!(PositionOpened {
+        position_mint: ctx.accounts.position_nft_mint.key(),
+        pool_id: vault.position_pool_id,
+        tick_lower: tick_lower_index,
+        tick_upper: tick_upper_index,
+        liquidity: vault.position_liquidity,
+        sol_used: vault.position_sol,
+        usdc_used: vault.position_usdc,
+    });
 
     Ok(())
 }

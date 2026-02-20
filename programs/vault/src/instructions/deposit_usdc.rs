@@ -2,6 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, MintTo, Token, TokenAccount, Transfer};
 
 use crate::errors::VaultError;
+use crate::events::DepositUsdcEvent;
 use crate::state::{seeds, UserDeposit, Vault};
 
 #[derive(Accounts)]
@@ -143,10 +144,13 @@ pub fn handler(ctx: Context<DepositUsdc>, amount: u64) -> Result<()> {
         .ok_or(error!(VaultError::MathOverflow))?;
     user_deposit.updated_at = current_time;
 
-    msg!("Deposited {} USDC (${} USD)", amount, deposit_value_usd);
-    msg!("Minted {} shares", shares_to_mint);
-    msg!("New total shares: {}", vault.total_shares);
-    msg!("New TVL: ${}", vault.tvl_usd);
+    emit!(DepositUsdcEvent {
+        user: ctx.accounts.user.key(),
+        amount,
+        shares_minted: shares_to_mint,
+        total_shares: vault.total_shares,
+        tvl_usd: vault.tvl_usd,
+    });
 
     Ok(())
 }

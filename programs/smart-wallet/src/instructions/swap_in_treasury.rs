@@ -9,6 +9,7 @@ use raydium_clmm_cpi::{
 };
 
 use crate::errors::WalletError;
+use crate::events::WalletSwapEvent;
 use crate::state::{seeds, SmartWallet};
 
 /// Swap direction enum
@@ -82,6 +83,7 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     direction: SwapDirection,
 ) -> Result<()> {
     require!(amount_in > 0, WalletError::InvalidAmount);
+    require!(!ctx.accounts.wallet.is_paused, WalletError::WalletPaused);
 
     let wallet = &ctx.accounts.wallet;
 
@@ -147,14 +149,11 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     let wallet = &mut ctx.accounts.wallet;
     wallet.updated_at = Clock::get()?.unix_timestamp;
 
-    msg!(
-        "Swap executed: {} {} -> {}",
+    emit!(WalletSwapEvent {
+        wallet: wallet.key(),
         amount_in,
-        if direction == SwapDirection::SolToUsdc { "SOL" } else { "USDC" },
-        if direction == SwapDirection::SolToUsdc { "USDC" } else { "SOL" }
-    );
-    msg!("SOL treasury: {}", ctx.accounts.sol_treasury.amount);
-    msg!("USDC treasury: {}", ctx.accounts.usdc_treasury.amount);
+        direction: if direction == SwapDirection::SolToUsdc { "SOL->USDC".to_string() } else { "USDC->SOL".to_string() },
+    });
 
     Ok(())
 }

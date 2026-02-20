@@ -2,6 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, MintTo, Token, TokenAccount, Transfer};
 
 use crate::errors::VaultError;
+use crate::events::DepositSolEvent;
 use crate::state::{seeds, UserDeposit, Vault};
 
 #[derive(Accounts)]
@@ -76,10 +77,10 @@ pub fn handler(ctx: Context<DepositSol>, amount: u64) -> Result<()> {
     // M-01: Check pause
     require!(!vault.is_paused, VaultError::VaultPaused);
 
-    // Check TVL is recent (within 10 minutes)
+    // L-01: Check TVL is recent (within 10 minutes), skip for first deposit
     let current_time = Clock::get()?.unix_timestamp;
     require!(
-        vault.sol_price_usd > 0 && current_time - vault.last_tvl_update < 600,
+        (vault.sol_price_usd > 0 && current_time - vault.last_tvl_update < 600) || vault.total_shares == 0,
         VaultError::StaleTvl
     );
 
@@ -144,14 +145,14 @@ pub fn handler(ctx: Context<DepositSol>, amount: u64) -> Result<()> {
         .ok_or(error!(VaultError::MathOverflow))?;
     user_deposit.updated_at = current_time;
 
-    msg!(
-        "Deposited {} lamports SOL (${} USD)",
+    emit!(DepositSolEvent {
+        user: ctx.accounts.user.key(),
         amount,
-        deposit_value_usd
-    );
-    msg!("Minted {} shares", shares_to_mint);
-    msg!("New total shares: {}", vault.total_shares);
-    msg!("New TVL: ${}", vault.tvl_usd);
+        deposit_value_usd,
+        shares_minted: shares_to_mint,
+        total_shares: vault.total_shares,
+        tvl_usd: vault.tvl_usd,
+    });
 
     Ok(())
 }

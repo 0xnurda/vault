@@ -9,6 +9,7 @@ use raydium_clmm_cpi::{
 };
 
 use crate::errors::WalletError;
+use crate::events::WalletLiquidityDecreased;
 use crate::state::{seeds, SmartWallet};
 
 #[derive(Accounts)]
@@ -159,10 +160,12 @@ pub fn handler(
     wallet.position_usdc = wallet.position_usdc.saturating_sub(usdc_received);
     wallet.updated_at = Clock::get()?.unix_timestamp;
 
-    msg!("Liquidity decreased");
-    msg!("SOL received: {}", sol_received);
-    msg!("USDC received: {}", usdc_received);
-    msg!("Remaining liquidity: {}", wallet.position_liquidity);
+    emit!(WalletLiquidityDecreased {
+        wallet: wallet.key(),
+        sol_received,
+        usdc_received,
+        remaining_liquidity: wallet.position_liquidity,
+    });
 
     Ok(())
 }

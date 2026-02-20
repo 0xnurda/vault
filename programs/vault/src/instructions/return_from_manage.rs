@@ -2,6 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 
 use crate::errors::VaultError;
+use crate::events::ReturnFromManageEvent;
 use crate::state::{seeds, Vault};
 
 #[derive(Accounts)]
@@ -88,7 +89,7 @@ pub fn handler(
         token::transfer(cpi_ctx, sol_amount)?;
 
         // Update vault state (treasury balance increased)
-        vault.treasury_sol = vault.treasury_sol.checked_add(sol_amount).unwrap();
+        vault.treasury_sol = vault.treasury_sol.checked_add(sol_amount).ok_or(error!(VaultError::MathOverflow))?;
     }
 
     // Transfer USDC from admin to treasury
@@ -105,14 +106,17 @@ pub fn handler(
         token::transfer(cpi_ctx, usdc_amount)?;
 
         // Update vault state
-        vault.treasury_usdc = vault.treasury_usdc.checked_add(usdc_amount).unwrap();
+        vault.treasury_usdc = vault.treasury_usdc.checked_add(usdc_amount).ok_or(error!(VaultError::MathOverflow))?;
     }
 
     // Note: TVL should be updated via update_tvl instruction after this
     // to reflect the new treasury balance + any remaining positions
 
-    msg!("Admin returned {} lamports SOL to treasury", sol_amount);
-    msg!("Admin returned {} USDC to treasury", usdc_amount);
+    emit!(ReturnFromManageEvent {
+        admin: ctx.accounts.admin.key(),
+        sol_amount,
+        usdc_amount,
+    });
 
     Ok(())
 }

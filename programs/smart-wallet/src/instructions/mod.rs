@@ -8,6 +8,8 @@ pub mod increase_liquidity;
 pub mod decrease_liquidity;
 pub mod collect_fees;
 pub mod swap_in_treasury;
+pub mod close_wallet;
+pub mod set_paused;
 
 pub use create_wallet::*;
 pub use deposit::*;
@@ -19,3 +21,5 @@ pub use increase_liquidity::*;
 pub use decrease_liquidity::*;
 pub use collect_fees::*;
 pub use swap_in_treasury::*;
+pub use close_wallet::*;
+pub use set_paused::*;

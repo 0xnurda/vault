@@ -9,6 +9,7 @@ use raydium_clmm_cpi::{
 };
 
 use crate::errors::WalletError;
+use crate::events::WalletFeesCollected;
 use crate::state::{seeds, SmartWallet};
 
 #[derive(Accounts)]
@@ -146,9 +147,11 @@ pub fn handler(ctx: Context<CollectFees>) -> Result<()> {
     let wallet = &mut ctx.accounts.wallet;
     wallet.updated_at = Clock::get()?.unix_timestamp;
 
-    msg!("Fees collected");
-    msg!("SOL fees: {}", sol_fees);
-    msg!("USDC fees: {}", usdc_fees);
+    emit!(WalletFeesCollected {
+        wallet: wallet.key(),
+        sol_fees,
+        usdc_fees,
+    });
 
     Ok(())
 }

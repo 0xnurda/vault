@@ -9,6 +9,7 @@ use raydium_clmm_cpi::{
 };
 
 use crate::errors::VaultError;
+use crate::events::LiquidityDecreased;
 use crate::state::{seeds, Vault};
 
 #[derive(Accounts)]
@@ -164,10 +165,11 @@ pub fn handler(
     vault.treasury_sol = ctx.accounts.sol_treasury.amount;
     vault.treasury_usdc = ctx.accounts.usdc_treasury.amount;
 
-    msg!("Liquidity decreased");
-    msg!("SOL received: {}", sol_received);
-    msg!("USDC received: {}", usdc_received);
-    msg!("Remaining liquidity: {}", vault.position_liquidity);
+    emit!(LiquidityDecreased {
+        sol_received,
+        usdc_received,
+        remaining_liquidity: vault.position_liquidity,
+    });
 
     Ok(())
 }

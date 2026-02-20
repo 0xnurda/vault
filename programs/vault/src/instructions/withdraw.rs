@@ -2,6 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Burn, Mint, Token, TokenAccount, Transfer};
 
 use crate::errors::VaultError;
+use crate::events::WithdrawEvent;
 use crate::state::{seeds, UserDeposit, Vault};
 
 #[derive(Accounts)]
@@ -78,9 +79,7 @@ pub struct Withdraw<'info> {
     pub token_program: Program<'info, Token>,
 }
 
-pub fn handler(ctx: Context<Withdraw>, shares_amount: u64) -> Result<()> {
-    require!(shares_amount > 0, VaultError::InvalidAmount);
-
+pub fn handler(ctx: Context<Withdraw>) -> Result<()> {
     let vault = &mut ctx.accounts.vault;
     let user_deposit = &mut ctx.accounts.user_deposit;
 
@@ -94,11 +93,9 @@ pub fn handler(ctx: Context<Withdraw>, shares_amount: u64) -> Result<()> {
         VaultError::StaleTvl
     );
 
-    // Check user has enough shares
-    require!(
-        user_deposit.shares >= shares_amount,
-        VaultError::InsufficientShares
-    );
+    // Full withdrawal only: burn ALL user shares
+    let shares_amount = user_deposit.shares;
+    require!(shares_amount > 0, VaultError::InsufficientShares);
     require!(
         ctx.accounts.user_share_account.amount >= shares_amount,
         VaultError::InsufficientShares
@@ -210,10 +207,13 @@ pub fn handler(ctx: Context<Withdraw>, shares_amount: u64) -> Result<()> {
         .ok_or(error!(VaultError::MathOverflow))?;
     user_deposit.updated_at = current_time;
 
-    msg!("Burned {} shares", shares_amount);
-    msg!("Withdrawn {} lamports SOL", sol_to_withdraw);
-    msg!("Withdrawn {} USDC", usdc_to_withdraw);
-    msg!("Withdrawal value: ${} USD", withdrawal_value_usd);
+    emit!(WithdrawEvent {
+        user: ctx.accounts.user.key(),
+        shares_burned: shares_amount,
+        sol_withdrawn: sol_to_withdraw,
+        usdc_withdrawn: usdc_to_withdraw,
+        withdrawal_value_usd,
+    });
 
     Ok(())
 }

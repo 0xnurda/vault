@@ -75,6 +75,9 @@ pub struct Vault {
 
     /// Whether the vault is paused (deposits/withdrawals disabled)
     pub is_paused: bool,
+
+    /// Pending admin for two-step admin transfer (Pubkey::default() = none)
+    pub pending_admin: Pubkey,
 }
 
 impl Vault {
@@ -103,7 +106,8 @@ impl Vault {
         4 +  // position_tick_upper (i32)
         32 + // position_pool_id
         1 +  // is_paused
-        63;  // padding for future fields
+        32 + // pending_admin
+        31;  // padding for future fields
 
     /// Calculate share price: TVL / total_shares (with 6 decimal precision)
     pub fn share_price(&self) -> u64 {

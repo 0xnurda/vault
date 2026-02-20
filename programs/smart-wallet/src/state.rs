@@ -56,6 +56,11 @@ pub struct SmartWallet {
     /// USDC treasury PDA bump
     pub usdc_treasury_bump: u8,
 
+    // ============ Flags ============
+
+    /// Whether the wallet is paused (deposits/position management disabled)
+    pub is_paused: bool,
+
     // ============ Timestamps ============
 
     /// Wallet creation timestamp
@@ -83,9 +88,10 @@ impl SmartWallet {
         1 +  // bump
         1 +  // sol_treasury_bump
         1 +  // usdc_treasury_bump
+        1 +  // is_paused
         8 +  // created_at
         8 +  // updated_at
-        64;  // padding for future fields
+        63;  // padding for future fields
 }
 
 /// Seeds for PDAs

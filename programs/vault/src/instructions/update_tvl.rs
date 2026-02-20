@@ -1,6 +1,7 @@
 use anchor_lang::prelude::*;
 
 use crate::errors::VaultError;
+use crate::events::TvlUpdated;
 use crate::state::{seeds, Vault};
 
 #[derive(Accounts)]
@@ -44,17 +45,12 @@ pub fn handler(ctx: Context<UpdateTvl>, tvl_usd: u64, sol_price: u64) -> Result<
     vault.sol_price_usd = sol_price;
     vault.last_tvl_update = Clock::get()?.unix_timestamp;
 
-    msg!(
-        "TVL updated: {} -> {} USD (6 decimals)",
+    emit!(TvlUpdated {
         old_tvl,
-        tvl_usd
-    );
-    msg!(
-        "SOL price updated: {} -> {} USD (6 decimals)",
-        old_price,
-        sol_price
-    );
-    msg!("Share price: {} (6 decimals)", vault.share_price());
+        new_tvl: tvl_usd,
+        sol_price,
+        share_price: vault.share_price(),
+    });
 
     Ok(())
 }

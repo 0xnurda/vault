@@ -3,6 +3,7 @@ use anchor_lang::prelude::*;
 pub mod state;
 pub mod instructions;
 pub mod errors;
+pub mod events;
 
 use instructions::*;
 
@@ -22,6 +23,16 @@ pub mod vault {
     /// Pause or unpause the vault
     pub fn set_paused(ctx: Context<SetPaused>, paused: bool) -> Result<()> {
         instructions::set_paused::handler(ctx, paused)
+    }
+
+    /// Step 1: Propose a new admin (current admin only)
+    pub fn transfer_admin(ctx: Context<TransferAdmin>, new_admin: Pubkey) -> Result<()> {
+        instructions::transfer_admin::handler(ctx, new_admin)
+    }
+
+    /// Step 2: New admin accepts the transfer
+    pub fn accept_admin(ctx: Context<AcceptAdmin>) -> Result<()> {
+        instructions::accept_admin::handler(ctx)
     }
 
     /// Update TVL (called by backend periodically)
@@ -125,8 +136,8 @@ pub mod vault {
         instructions::deposit_usdc::handler(ctx, amount)
     }
 
-    /// Withdraw from vault (burn shares, receive SOL/USDC)
-    pub fn withdraw(ctx: Context<Withdraw>, shares_amount: u64) -> Result<()> {
-        instructions::withdraw::handler(ctx, shares_amount)
+    /// Full withdrawal from vault (burn ALL shares, receive SOL/USDC)
+    pub fn withdraw(ctx: Context<Withdraw>) -> Result<()> {
+        instructions::withdraw::handler(ctx)
     }
 }

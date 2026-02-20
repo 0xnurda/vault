@@ -8,6 +8,7 @@ use raydium_clmm_cpi::{
 };
 
 use crate::errors::WalletError;
+use crate::events::WalletLiquidityIncreased;
 use crate::state::{seeds, SmartWallet};
 
 #[derive(Accounts)]
@@ -98,6 +99,7 @@ pub fn handler(
     amount_1_max: u64,
 ) -> Result<()> {
     require!(liquidity > 0 || amount_0_max > 0, WalletError::InvalidAmount);
+    require!(!ctx.accounts.wallet.is_paused, WalletError::WalletPaused);
 
     let wallet = &ctx.accounts.wallet;
 
@@ -166,10 +168,12 @@ pub fn handler(
     wallet.position_usdc = wallet.position_usdc.saturating_add(usdc_used);
     wallet.updated_at = Clock::get()?.unix_timestamp;
 
-    msg!("Liquidity increased");
-    msg!("SOL added: {}", sol_used);
-    msg!("USDC added: {}", usdc_used);
-    msg!("New liquidity: {}", wallet.position_liquidity);
+    emit!(WalletLiquidityIncreased {
+        wallet: wallet.key(),
+        sol_added: sol_used,
+        usdc_added: usdc_used,
+        new_liquidity: wallet.position_liquidity,
+    });
 
     Ok(())
 }

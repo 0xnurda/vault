@@ -9,6 +9,7 @@ use raydium_clmm_cpi::{
 };
 
 use crate::errors::VaultError;
+use crate::events::SwapEvent;
 use crate::state::{seeds, Vault};
 
 /// Swap direction enum
@@ -179,14 +180,12 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     vault.treasury_sol = ctx.accounts.sol_treasury.amount;
     vault.treasury_usdc = ctx.accounts.usdc_treasury.amount;
 
-    msg!(
-        "Swap executed: {} {} → {}",
+    emit!(SwapEvent {
         amount_in,
-        if direction == SwapDirection::SolToUsdc { "SOL" } else { "USDC" },
-        if direction == SwapDirection::SolToUsdc { "USDC" } else { "SOL" }
-    );
-    msg!("New treasury SOL: {}", vault.treasury_sol);
-    msg!("New treasury USDC: {}", vault.treasury_usdc);
+        direction: if direction == SwapDirection::SolToUsdc { "SOL->USDC".to_string() } else { "USDC->SOL".to_string() },
+        treasury_sol: vault.treasury_sol,
+        treasury_usdc: vault.treasury_usdc,
+    });
 
     Ok(())
 }

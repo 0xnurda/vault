@@ -1,6 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{Mint, Token, TokenAccount};
 
+use crate::events::VaultInitialized;
 use crate::state::{seeds, Vault};
 
 #[derive(Accounts)]
@@ -84,11 +85,12 @@ pub fn handler(ctx: Context<Initialize>) -> Result<()> {
     vault.usdc_treasury_bump = ctx.bumps.usdc_treasury;
     vault.share_mint_bump = ctx.bumps.share_mint;
 
-    msg!("Vault initialized!");
-    msg!("Admin: {}", vault.admin);
-    msg!("Share Mint: {}", vault.share_mint);
-    msg!("SOL Treasury: {}", vault.sol_treasury);
-    msg!("USDC Treasury: {}", vault.usdc_treasury);
+    emit!(VaultInitialized {
+        admin: vault.admin,
+        share_mint: vault.share_mint,
+        sol_treasury: vault.sol_treasury,
+        usdc_treasury: vault.usdc_treasury,
+    });
 
     Ok(())
 }

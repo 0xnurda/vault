@@ -2,6 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 
 use crate::errors::VaultError;
+use crate::events::WithdrawToManageEvent;
 use crate::state::{seeds, Vault};
 
 #[derive(Accounts)]
@@ -74,6 +75,20 @@ pub fn handler(
         VaultError::InsufficientTreasuryBalance
     );
 
+    // L-04: Limit withdrawals to max 50% of each treasury per call
+    if sol_amount > 0 {
+        require!(
+            sol_amount <= ctx.accounts.sol_treasury.amount / 2,
+            VaultError::WithdrawalExceedsTreasury
+        );
+    }
+    if usdc_amount > 0 {
+        require!(
+            usdc_amount <= ctx.accounts.usdc_treasury.amount / 2,
+            VaultError::WithdrawalExceedsTreasury
+        );
+    }
+
     // Transfer SOL from treasury to admin
     if sol_amount > 0 {
         let vault_key = vault.key();
@@ -97,7 +112,7 @@ pub fn handler(
         token::transfer(cpi_ctx, sol_amount)?;
 
         // Update vault state (treasury balance reduced)
-        vault.treasury_sol = vault.treasury_sol.checked_sub(sol_amount).unwrap();
+        vault.treasury_sol = vault.treasury_sol.checked_sub(sol_amount).ok_or(error!(VaultError::MathOverflow))?;
     }
 
     // Transfer USDC from treasury to admin
@@ -123,14 +138,17 @@ pub fn handler(
         token::transfer(cpi_ctx, usdc_amount)?;
 
         // Update vault state
-        vault.treasury_usdc = vault.treasury_usdc.checked_sub(usdc_amount).unwrap();
+        vault.treasury_usdc = vault.treasury_usdc.checked_sub(usdc_amount).ok_or(error!(VaultError::MathOverflow))?;
     }
 
     // Note: TVL is NOT reduced here because funds are still "managed"
     // TVL will be updated by update_tvl instruction which includes position values
 
-    msg!("Admin withdrew {} lamports SOL for management", sol_amount);
-    msg!("Admin withdrew {} USDC for management", usdc_amount);
+    emit!(WithdrawToManageEvent {
+        admin: ctx.accounts.admin.key(),
+        sol_amount,
+        usdc_amount,
+    });
 
     Ok(())
 }

@@ -1,6 +1,7 @@
 use anchor_lang::prelude::*;
 
 use crate::errors::WalletError;
+use crate::events::DelegateSet;
 use crate::state::{seeds, SmartWallet};
 
 #[derive(Accounts)]
@@ -27,11 +28,11 @@ pub fn handler(ctx: Context<SetDelegate>, new_delegate: Pubkey) -> Result<()> {
     wallet.delegate = new_delegate;
     wallet.updated_at = Clock::get()?.unix_timestamp;
 
-    if new_delegate == Pubkey::default() {
-        msg!("Delegate removed (was {})", old_delegate);
-    } else {
-        msg!("Delegate set to {}", new_delegate);
-    }
+    emit!(DelegateSet {
+        wallet: wallet.key(),
+        old_delegate,
+        new_delegate,
+    });
 
     Ok(())
 }

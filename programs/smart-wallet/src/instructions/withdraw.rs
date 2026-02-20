@@ -2,6 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 
 use crate::errors::WalletError;
+use crate::events::WalletWithdrawEvent;
 use crate::state::{seeds, SmartWallet};
 
 #[derive(Accounts)]
@@ -27,6 +28,7 @@ pub struct Withdraw<'info> {
     #[account(
         mut,
         constraint = user_token_account.owner == user.key(),
+        constraint = user_token_account.mint == treasury.mint @ WalletError::InvalidMint,
     )]
     pub user_token_account: Box<Account<'info, TokenAccount>>,
 
@@ -80,11 +82,12 @@ pub fn handler(ctx: Context<Withdraw>, amount: u64, is_sol: bool) -> Result<()> 
     let wallet = &mut ctx.accounts.wallet;
     wallet.updated_at = Clock::get()?.unix_timestamp;
 
-    msg!(
-        "Withdrawn {} {} from smart wallet",
+    emit!(WalletWithdrawEvent {
+        wallet: wallet.key(),
+        user: ctx.accounts.user.key(),
         amount,
-        if is_sol { "SOL" } else { "USDC" }
-    );
+        is_sol,
+    });
 
     Ok(())
 }

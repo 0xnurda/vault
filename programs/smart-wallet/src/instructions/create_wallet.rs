@@ -1,6 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{Mint, Token, TokenAccount};
 
+use crate::events::WalletCreated;
 use crate::state::{seeds, SmartWallet};
 
 #[derive(Accounts)]
@@ -42,6 +43,9 @@ pub struct CreateWallet<'info> {
     pub usdc_treasury: Box<Account<'info, TokenAccount>>,
 
     /// Wrapped SOL mint
+    #[account(
+        constraint = wsol_mint.key() == anchor_spl::token::spl_token::native_mint::ID,
+    )]
     pub wsol_mint: Box<Account<'info, Mint>>,
 
     /// USDC mint
@@ -73,14 +77,17 @@ pub fn handler(ctx: Context<CreateWallet>) -> Result<()> {
     wallet.bump = ctx.bumps.wallet;
     wallet.sol_treasury_bump = ctx.bumps.sol_treasury;
     wallet.usdc_treasury_bump = ctx.bumps.usdc_treasury;
+    wallet.is_paused = false;
 
     let now = Clock::get()?.unix_timestamp;
     wallet.created_at = now;
     wallet.updated_at = now;
 
-    msg!("Smart wallet created for {}", wallet.owner);
-    msg!("SOL Treasury: {}", wallet.sol_treasury);
-    msg!("USDC Treasury: {}", wallet.usdc_treasury);
+    emit!(WalletCreated {
+        owner: wallet.owner,
+        sol_treasury: wallet.sol_treasury,
+        usdc_treasury: wallet.usdc_treasury,
+    });
 
     Ok(())
 }

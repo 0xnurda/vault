@@ -5,10 +5,11 @@ use anchor_spl::token_2022::Token2022;
 use anchor_spl::token_interface::{Mint, TokenAccount};
 use raydium_clmm_cpi::{
     cpi,
-    states::PoolState,
+    states::{PersonalPositionState, PoolState},
 };
 
 use crate::errors::WalletError;
+use crate::events::WalletPositionOpened;
 use crate::state::{seeds, SmartWallet};
 
 #[derive(Accounts)]
@@ -113,6 +114,7 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     amount_1_max: u64,
 ) -> Result<()> {
     require!(liquidity > 0 || amount_0_max > 0, WalletError::InvalidAmount);
+    require!(!ctx.accounts.wallet.is_paused, WalletError::WalletPaused);
 
     let wallet = &ctx.accounts.wallet;
 
@@ -260,15 +262,24 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     wallet.position_pool_id = ctx.accounts.pool_state.key();
     wallet.position_tick_lower = tick_lower_index;
     wallet.position_tick_upper = tick_upper_index;
-    wallet.position_liquidity = liquidity;
+    // Read actual liquidity from personal_position after CPI (not the requested value)
+    let position_data = ctx.accounts.personal_position.try_borrow_data()?;
+    let personal_pos = PersonalPositionState::try_deserialize(&mut &position_data[..])?;
+    wallet.position_liquidity = personal_pos.liquidity;
     wallet.position_sol = sol_used;
     wallet.position_usdc = usdc_used;
     wallet.updated_at = Clock::get()?.unix_timestamp;
 
-    msg!("Position opened: {}", ctx.accounts.position_nft_mint.key());
-    msg!("Tick range: {} - {}", tick_lower_index, tick_upper_index);
-    msg!("SOL used: {}", sol_used);
-    msg!("USDC used: {}", usdc_used);
+    emit!(WalletPositionOpened {
+        wallet: wallet.key(),
+        position_mint: ctx.accounts.position_nft_mint.key(),
+        pool_id: wallet.position_pool_id,
+        tick_lower: tick_lower_index,
+        tick_upper: tick_upper_index,
+        liquidity: wallet.position_liquidity,
+        sol_used,
+        usdc_used,
+    });
 
     Ok(())
 }

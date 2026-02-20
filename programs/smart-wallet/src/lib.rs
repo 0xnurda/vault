@@ -1,6 +1,7 @@
 use anchor_lang::prelude::*;
 
 pub mod errors;
+pub mod events;
 pub mod instructions;
 pub mod state;
 
@@ -27,6 +28,16 @@ pub mod smart_wallet {
     /// Withdraw SOL or USDC from treasury back to user (owner only)
     pub fn withdraw(ctx: Context<Withdraw>, amount: u64, is_sol: bool) -> Result<()> {
         instructions::withdraw::handler(ctx, amount, is_sol)
+    }
+
+    /// Close smart wallet and return rent to owner (owner only)
+    pub fn close_wallet(ctx: Context<CloseWallet>) -> Result<()> {
+        instructions::close_wallet::handler(ctx)
+    }
+
+    /// Pause or unpause the wallet (owner only)
+    pub fn set_paused(ctx: Context<SetPaused>, paused: bool) -> Result<()> {
+        instructions::set_paused::handler(ctx, paused)
     }
 
     // ============ AUTOMATED MANAGEMENT (delegate or owner) ============

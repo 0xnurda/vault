@@ -12,6 +12,8 @@ pub mod increase_liquidity;
 pub mod decrease_liquidity;
 pub mod collect_fees;
 pub mod set_paused;
+pub mod transfer_admin;
+pub mod accept_admin;
 
 pub use initialize::*;
 pub use update_tvl::*;
@@ -27,3 +29,5 @@ pub use increase_liquidity::*;
 pub use decrease_liquidity::*;
 pub use collect_fees::*;
 pub use set_paused::*;
+pub use transfer_admin::*;
+pub use accept_admin::*;

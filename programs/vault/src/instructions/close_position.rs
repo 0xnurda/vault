@@ -9,6 +9,7 @@ use raydium_clmm_cpi::{
 };
 
 use crate::errors::VaultError;
+use crate::events::PositionClosed;
 use crate::state::{seeds, Vault};
 
 #[derive(Accounts)]
@@ -105,7 +106,8 @@ pub struct ClosePosition<'info> {
 
 pub fn handler(ctx: Context<ClosePosition>, amount_0_min: u64, amount_1_min: u64) -> Result<()> {
     let vault = &ctx.accounts.vault;
-    let liquidity = vault.position_liquidity;
+    // Use actual liquidity from personal_position, not stored value
+    let liquidity = ctx.accounts.personal_position.liquidity;
 
     require!(liquidity > 0, VaultError::NoActivePosition);
 
@@ -179,9 +181,10 @@ pub fn handler(ctx: Context<ClosePosition>, amount_0_min: u64, amount_1_min: u64
     vault.treasury_sol = ctx.accounts.sol_treasury.amount;
     vault.treasury_usdc = ctx.accounts.usdc_treasury.amount;
 
-    msg!("Position closed");
-    msg!("Treasury SOL: {}", vault.treasury_sol);
-    msg!("Treasury USDC: {}", vault.treasury_usdc);
+    emit!(PositionClosed {
+        treasury_sol: vault.treasury_sol,
+        treasury_usdc: vault.treasury_usdc,
+    });
 
     Ok(())
 }

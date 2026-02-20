@@ -31,4 +31,10 @@ pub enum WalletError {
 
     #[msg("Insufficient approved amount")]
     InsufficientApproval,
+
+    #[msg("Token mint mismatch")]
+    InvalidMint,
+
+    #[msg("Wallet is paused")]
+    WalletPaused,
 }

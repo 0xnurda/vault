@@ -9,6 +9,7 @@ use raydium_clmm_cpi::{
 };
 
 use crate::errors::VaultError;
+use crate::events::FeesCollected;
 use crate::state::{seeds, Vault};
 
 /// Collect accumulated trading fees from the position.
@@ -153,9 +154,10 @@ pub fn handler(ctx: Context<CollectFees>) -> Result<()> {
     vault.treasury_sol = ctx.accounts.sol_treasury.amount;
     vault.treasury_usdc = ctx.accounts.usdc_treasury.amount;
 
-    msg!("Fees collected");
-    msg!("SOL fees: {}", sol_fees);
-    msg!("USDC fees: {}", usdc_fees);
+    emit!(FeesCollected {
+        sol_fees,
+        usdc_fees,
+    });
 
     Ok(())
 }

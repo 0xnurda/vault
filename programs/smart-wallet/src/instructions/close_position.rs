@@ -9,6 +9,7 @@ use raydium_clmm_cpi::{
 };
 
 use crate::errors::WalletError;
+use crate::events::WalletPositionClosed;
 use crate::state::{seeds, SmartWallet};
 
 #[derive(Accounts)]
@@ -103,7 +104,8 @@ pub struct ClosePosition<'info> {
 
 pub fn handler(ctx: Context<ClosePosition>, amount_0_min: u64, amount_1_min: u64) -> Result<()> {
     let wallet = &ctx.accounts.wallet;
-    let liquidity = wallet.position_liquidity;
+    // H-04: Use actual liquidity from personal_position, not stored value
+    let liquidity = ctx.accounts.personal_position.liquidity;
 
     require!(liquidity > 0, WalletError::NoActivePosition);
 
@@ -177,9 +179,11 @@ pub fn handler(ctx: Context<ClosePosition>, amount_0_min: u64, amount_1_min: u64
     wallet.position_usdc = 0;
     wallet.updated_at = Clock::get()?.unix_timestamp;
 
-    msg!("Position closed");
-    msg!("SOL treasury: {}", ctx.accounts.sol_treasury.amount);
-    msg!("USDC treasury: {}", ctx.accounts.usdc_treasury.amount);
+    emit!(WalletPositionClosed {
+        wallet: wallet.key(),
+        sol_treasury: ctx.accounts.sol_treasury.amount,
+        usdc_treasury: ctx.accounts.usdc_treasury.amount,
+    });
 
     Ok(())
 }

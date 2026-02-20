@@ -2,6 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 
 use crate::errors::WalletError;
+use crate::events::FundTreasuryEvent;
 use crate::state::{seeds, SmartWallet};
 
 /// Fund treasury — backend (delegate) pulls tokens from user's account via approve/delegate.
@@ -36,6 +37,7 @@ pub struct FundTreasury<'info> {
 
 pub fn handler(ctx: Context<FundTreasury>, amount: u64, is_sol: bool) -> Result<()> {
     require!(amount > 0, WalletError::InvalidAmount);
+    require!(!ctx.accounts.wallet.is_paused, WalletError::WalletPaused);
 
     let wallet = &ctx.accounts.wallet;
 
@@ -85,11 +87,12 @@ pub fn handler(ctx: Context<FundTreasury>, amount: u64, is_sol: bool) -> Result<
     let wallet = &mut ctx.accounts.wallet;
     wallet.updated_at = Clock::get()?.unix_timestamp;
 
-    msg!(
-        "Pulled {} {} from user into treasury",
+    emit!(FundTreasuryEvent {
+        wallet: wallet.key(),
+        operator: ctx.accounts.operator.key(),
         amount,
-        if is_sol { "SOL" } else { "USDC" }
-    );
+        is_sol,
+    });
 
     Ok(())
 }
