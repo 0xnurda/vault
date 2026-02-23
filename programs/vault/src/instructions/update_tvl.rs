@@ -29,7 +29,6 @@ pub fn handler(ctx: Context<UpdateTvl>, tvl_usd: u64, sol_price: u64) -> Result<
     require!(sol_price > 0, VaultError::InvalidSolPrice);
 
     let old_tvl = vault.tvl_usd;
-    let old_price = vault.sol_price_usd;
 
     // C-02: Sanity checks — max 20% TVL change per update when shares exist
     if vault.total_shares > 0 && old_tvl > 0 {
