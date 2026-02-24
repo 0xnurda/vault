@@ -223,7 +223,7 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
         amount_0_max,
         amount_1_max,
         true, // with_metadata
-        Some(true), // base_flag: calculate from amount_0
+        Some(false), // base_flag: calculate from amount_1 (USDC)
     )?;
 
     // H-05: Revoke delegations after CPI

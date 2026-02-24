@@ -109,42 +109,42 @@ pub fn handler(ctx: Context<ClosePosition>, amount_0_min: u64, amount_1_min: u64
     // Use actual liquidity from personal_position, not stored value
     let liquidity = ctx.accounts.personal_position.liquidity;
 
-    require!(liquidity > 0, VaultError::NoActivePosition);
-
     // Build signer seeds for vault PDA
     let vault_seeds: &[&[&[u8]]] = &[&[
         seeds::VAULT,
         &[vault.bump],
     ]];
 
-    // First, decrease all liquidity
-    let decrease_accounts = cpi::accounts::DecreaseLiquidityV2 {
-        nft_owner: ctx.accounts.vault.to_account_info(),
-        nft_account: ctx.accounts.position_nft_account.to_account_info(),
-        personal_position: ctx.accounts.personal_position.to_account_info(),
-        pool_state: ctx.accounts.pool_state.to_account_info(),
-        protocol_position: ctx.accounts.personal_position.to_account_info(),
-        token_vault_0: ctx.accounts.token_vault_0.to_account_info(),
-        token_vault_1: ctx.accounts.token_vault_1.to_account_info(),
-        tick_array_lower: ctx.accounts.tick_array_lower.to_account_info(),
-        tick_array_upper: ctx.accounts.tick_array_upper.to_account_info(),
-        recipient_token_account_0: ctx.accounts.sol_treasury.to_account_info(),
-        recipient_token_account_1: ctx.accounts.usdc_treasury.to_account_info(),
-        token_program: ctx.accounts.token_program.to_account_info(),
-        token_program_2022: ctx.accounts.token_program_2022.to_account_info(),
-        memo_program: ctx.accounts.memo_program.to_account_info(),
-        vault_0_mint: ctx.accounts.vault_0_mint.to_account_info(),
-        vault_1_mint: ctx.accounts.vault_1_mint.to_account_info(),
-    };
+    // Only decrease liquidity if position has non-zero liquidity
+    if liquidity > 0 {
+        let decrease_accounts = cpi::accounts::DecreaseLiquidityV2 {
+            nft_owner: ctx.accounts.vault.to_account_info(),
+            nft_account: ctx.accounts.position_nft_account.to_account_info(),
+            personal_position: ctx.accounts.personal_position.to_account_info(),
+            pool_state: ctx.accounts.pool_state.to_account_info(),
+            protocol_position: ctx.accounts.personal_position.to_account_info(),
+            token_vault_0: ctx.accounts.token_vault_0.to_account_info(),
+            token_vault_1: ctx.accounts.token_vault_1.to_account_info(),
+            tick_array_lower: ctx.accounts.tick_array_lower.to_account_info(),
+            tick_array_upper: ctx.accounts.tick_array_upper.to_account_info(),
+            recipient_token_account_0: ctx.accounts.sol_treasury.to_account_info(),
+            recipient_token_account_1: ctx.accounts.usdc_treasury.to_account_info(),
+            token_program: ctx.accounts.token_program.to_account_info(),
+            token_program_2022: ctx.accounts.token_program_2022.to_account_info(),
+            memo_program: ctx.accounts.memo_program.to_account_info(),
+            vault_0_mint: ctx.accounts.vault_0_mint.to_account_info(),
+            vault_1_mint: ctx.accounts.vault_1_mint.to_account_info(),
+        };
 
-    let decrease_ctx = CpiContext::new_with_signer(
-        ctx.accounts.clmm_program.to_account_info(),
-        decrease_accounts,
-        vault_seeds,
-    );
+        let decrease_ctx = CpiContext::new_with_signer(
+            ctx.accounts.clmm_program.to_account_info(),
+            decrease_accounts,
+            vault_seeds,
+        );
 
-    // H-02: Use slippage params instead of 0
-    cpi::decrease_liquidity_v2(decrease_ctx, liquidity, amount_0_min, amount_1_min)?;
+        // H-02: Use slippage params instead of 0
+        cpi::decrease_liquidity_v2(decrease_ctx, liquidity, amount_0_min, amount_1_min)?;
+    }
 
     // Then close the position
     let close_accounts = cpi::accounts::ClosePosition {
@@ -153,7 +153,7 @@ pub fn handler(ctx: Context<ClosePosition>, amount_0_min: u64, amount_1_min: u64
         position_nft_account: ctx.accounts.position_nft_account.to_account_info(),
         personal_position: ctx.accounts.personal_position.to_account_info(),
         system_program: ctx.accounts.system_program.to_account_info(),
-        token_program: ctx.accounts.token_program.to_account_info(),
+        token_program: ctx.accounts.token_program_2022.to_account_info(),
     };
 
     let close_ctx = CpiContext::new_with_signer(

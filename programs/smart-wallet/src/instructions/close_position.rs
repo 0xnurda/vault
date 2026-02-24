@@ -152,7 +152,8 @@ pub fn handler(ctx: Context<ClosePosition>, amount_0_min: u64, amount_1_min: u64
         position_nft_account: ctx.accounts.position_nft_account.to_account_info(),
         personal_position: ctx.accounts.personal_position.to_account_info(),
         system_program: ctx.accounts.system_program.to_account_info(),
-        token_program: ctx.accounts.token_program.to_account_info(),
+        // NFT is a Token2022 token — must pass token_program_2022
+        token_program: ctx.accounts.token_program_2022.to_account_info(),
     };
 
     let close_ctx = CpiContext::new_with_signer(

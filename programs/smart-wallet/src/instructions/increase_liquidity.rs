@@ -116,13 +116,50 @@ pub fn handler(
     let sol_before = ctx.accounts.sol_treasury.amount;
     let usdc_before = ctx.accounts.usdc_treasury.amount;
 
-    // Build signer seeds for wallet PDA
+    // Build signer seeds
     let owner_key = wallet.owner;
+    let wallet_key = wallet.key();
     let wallet_seeds: &[&[&[u8]]] = &[&[
         seeds::SMART_WALLET,
         owner_key.as_ref(),
         &[wallet.bump],
     ]];
+    let sol_treasury_seeds: &[&[u8]] = &[
+        seeds::WALLET_SOL_TREASURY,
+        wallet_key.as_ref(),
+        &[wallet.sol_treasury_bump],
+    ];
+    let usdc_treasury_seeds: &[&[u8]] = &[
+        seeds::WALLET_USDC_TREASURY,
+        wallet_key.as_ref(),
+        &[wallet.usdc_treasury_bump],
+    ];
+
+    // Approve wallet PDA as delegate on treasury accounts so Raydium can use it as authority
+    anchor_spl::token_interface::approve(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            anchor_spl::token_interface::Approve {
+                to: ctx.accounts.sol_treasury.to_account_info(),
+                delegate: ctx.accounts.wallet.to_account_info(),
+                authority: ctx.accounts.sol_treasury.to_account_info(),
+            },
+            &[sol_treasury_seeds],
+        ),
+        amount_0_max,
+    )?;
+    anchor_spl::token_interface::approve(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            anchor_spl::token_interface::Approve {
+                to: ctx.accounts.usdc_treasury.to_account_info(),
+                delegate: ctx.accounts.wallet.to_account_info(),
+                authority: ctx.accounts.usdc_treasury.to_account_info(),
+            },
+            &[usdc_treasury_seeds],
+        ),
+        amount_1_max,
+    )?;
 
     let cpi_accounts = cpi::accounts::IncreaseLiquidityV2 {
         nft_owner: ctx.accounts.wallet.to_account_info(),
@@ -149,6 +186,28 @@ pub fn handler(
     );
 
     cpi::increase_liquidity_v2(cpi_ctx, liquidity, amount_0_max, amount_1_max, Some(true))?;
+
+    // Revoke delegations after CPI
+    anchor_spl::token_interface::revoke(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            anchor_spl::token_interface::Revoke {
+                source: ctx.accounts.sol_treasury.to_account_info(),
+                authority: ctx.accounts.sol_treasury.to_account_info(),
+            },
+            &[sol_treasury_seeds],
+        ),
+    )?;
+    anchor_spl::token_interface::revoke(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            anchor_spl::token_interface::Revoke {
+                source: ctx.accounts.usdc_treasury.to_account_info(),
+                authority: ctx.accounts.usdc_treasury.to_account_info(),
+            },
+            &[usdc_treasury_seeds],
+        ),
+    )?;
 
     // Reload treasuries
     ctx.accounts.sol_treasury.reload()?;
