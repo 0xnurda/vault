@@ -101,6 +101,7 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     direction: SwapDirection,
 ) -> Result<()> {
     require!(amount_in > 0, VaultError::InvalidAmount);
+    require!(minimum_amount_out > 0, VaultError::InvalidAmount); // Prevent 0-slippage swaps
 
     let vault = &ctx.accounts.vault;
 

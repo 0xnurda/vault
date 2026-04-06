@@ -5,13 +5,31 @@ use crate::errors::VaultError;
 use crate::events::WithdrawEvent;
 use crate::state::{seeds, UserDeposit, Vault};
 
+/// Withdraw burns ALL of the user's shares and returns their proportional share
+/// of the **total** vault TVL:
+///
+///   total_user_sol  = treasury_sol  - protocol_fees_sol  + position_sol
+///   total_user_usdc = treasury_usdc - protocol_fees_usdc + position_usdc
+///   sol_out  = total_user_sol  × (user_shares / total_shares)
+///   usdc_out = total_user_usdc × (user_shares / total_shares)
+///
+/// Payout comes from treasury only (admin keeps a buffer there).
+/// If treasury cannot cover the full entitlement the instruction fails with
+/// `WithdrawalExceedsTreasury`; the admin must call `decrease_liquidity`
+/// (or `close_position`) first to replenish the treasury, then the user retries.
+///
+/// **position_sol/usdc are NOT reduced here.**  Those fields represent the
+/// TOTAL vault position (shared by all remaining holders).  The treasury buffer
+/// "fronts" the position portion of the withdrawn user's entitlement; when
+/// close_position eventually returns all position funds to treasury the maths
+/// resolves correctly for remaining shareholders.
+///
+/// No Pyth price feed is needed — pure token ratios are used.
 #[derive(Accounts)]
 pub struct Withdraw<'info> {
-    /// User making the withdrawal
     #[account(mut)]
     pub user: Signer<'info>,
 
-    /// Vault state
     #[account(
         mut,
         seeds = [seeds::VAULT],
@@ -19,7 +37,6 @@ pub struct Withdraw<'info> {
     )]
     pub vault: Box<Account<'info, Vault>>,
 
-    /// User's deposit record
     #[account(
         mut,
         seeds = [seeds::USER_DEPOSIT, vault.key().as_ref(), user.key().as_ref()],
@@ -28,7 +45,6 @@ pub struct Withdraw<'info> {
     )]
     pub user_deposit: Box<Account<'info, UserDeposit>>,
 
-    /// Share mint (for burning)
     #[account(
         mut,
         seeds = [seeds::SHARE_MINT, vault.key().as_ref()],
@@ -36,7 +52,6 @@ pub struct Withdraw<'info> {
     )]
     pub share_mint: Box<Account<'info, Mint>>,
 
-    /// User's share token account (source - will burn from here)
     #[account(
         mut,
         constraint = user_share_account.owner == user.key(),
@@ -44,7 +59,6 @@ pub struct Withdraw<'info> {
     )]
     pub user_share_account: Box<Account<'info, TokenAccount>>,
 
-    /// SOL treasury
     #[account(
         mut,
         seeds = [seeds::SOL_TREASURY, vault.key().as_ref()],
@@ -52,7 +66,6 @@ pub struct Withdraw<'info> {
     )]
     pub sol_treasury: Box<Account<'info, TokenAccount>>,
 
-    /// USDC treasury
     #[account(
         mut,
         seeds = [seeds::USDC_TREASURY, vault.key().as_ref()],
@@ -60,7 +73,6 @@ pub struct Withdraw<'info> {
     )]
     pub usdc_treasury: Box<Account<'info, TokenAccount>>,
 
-    /// User's wSOL token account (destination for SOL)
     #[account(
         mut,
         constraint = user_wsol_account.owner == user.key(),
@@ -68,7 +80,6 @@ pub struct Withdraw<'info> {
     )]
     pub user_wsol_account: Box<Account<'info, TokenAccount>>,
 
-    /// User's USDC token account (destination for USDC)
     #[account(
         mut,
         constraint = user_usdc_account.owner == user.key(),
@@ -82,18 +93,11 @@ pub struct Withdraw<'info> {
 pub fn handler(ctx: Context<Withdraw>) -> Result<()> {
     let vault = &mut ctx.accounts.vault;
     let user_deposit = &mut ctx.accounts.user_deposit;
-
-    // M-01: Check pause
-    require!(!vault.is_paused, VaultError::VaultPaused);
-
-    // H-01: Check TVL freshness
     let current_time = Clock::get()?.unix_timestamp;
-    require!(
-        current_time - vault.last_tvl_update < 600,
-        VaultError::StaleTvl
-    );
 
-    // Full withdrawal only: burn ALL user shares
+    require!(!vault.is_paused, VaultError::VaultPaused);
+    require!(!vault.is_rebalancing, VaultError::RebalancingInProgress);
+
     let shares_amount = user_deposit.shares;
     require!(shares_amount > 0, VaultError::InsufficientShares);
     require!(
@@ -101,72 +105,97 @@ pub fn handler(ctx: Context<Withdraw>) -> Result<()> {
         VaultError::InsufficientShares
     );
 
-    // Calculate withdrawal value in USD
-    let withdrawal_value_usd = vault.calculate_withdrawal_value(shares_amount);
+    let total_shares = vault.total_shares;
+    require!(total_shares > 0, VaultError::InsufficientShares);
 
-    // H-03: Use actual on-chain balances instead of state
-    let actual_sol = ctx.accounts.sol_treasury.amount;
-    let actual_usdc = ctx.accounts.usdc_treasury.amount;
+    // ── Total user-accessible funds = treasury + CLMM position − protocol fees ──
+    //
+    // position_sol / position_usdc = amounts originally deposited into the open
+    // Raydium position (updated at open_position / increase_liquidity /
+    // decrease_liquidity; zeroed at close_position).
+    //
+    // accumulated_protocol_fees belong to the protocol and are excluded.
+    let total_user_sol = vault
+        .treasury_sol
+        .saturating_sub(vault.accumulated_protocol_fees_sol)
+        .saturating_add(vault.position_sol);
 
-    // C-01: Use u128 for intermediate math to prevent overflow
-    let user_ratio_num = shares_amount;
-    let user_ratio_den = vault.total_shares;
+    let total_user_usdc = vault
+        .treasury_usdc
+        .saturating_sub(vault.accumulated_protocol_fees_usdc)
+        .saturating_add(vault.position_usdc);
 
-    let sol_to_withdraw = (actual_sol as u128)
-        .checked_mul(user_ratio_num as u128)
-        .and_then(|v| v.checked_div(user_ratio_den as u128))
+    // ── User's proportional entitlement ──────────────────────────────────────
+    let sol_to_withdraw = (total_user_sol as u128)
+        .checked_mul(shares_amount as u128)
+        .and_then(|v| v.checked_div(total_shares as u128))
         .and_then(|v| u64::try_from(v).ok())
         .ok_or(error!(VaultError::MathOverflow))?;
 
-    let usdc_to_withdraw = (actual_usdc as u128)
-        .checked_mul(user_ratio_num as u128)
-        .and_then(|v| v.checked_div(user_ratio_den as u128))
+    let usdc_to_withdraw = (total_user_usdc as u128)
+        .checked_mul(shares_amount as u128)
+        .and_then(|v| v.checked_div(total_shares as u128))
         .and_then(|v| u64::try_from(v).ok())
         .ok_or(error!(VaultError::MathOverflow))?;
 
-    // Check treasury has enough
+    // ── Treasury availability check ───────────────────────────────────────────
+    //
+    // We can only physically pay from treasury.  If the buffer is insufficient
+    // (because most TVL is locked in a Raydium position) the admin must first
+    // call decrease_liquidity to replenish treasury, then the user retries.
+    let available_sol = ctx
+        .accounts
+        .sol_treasury
+        .amount
+        .saturating_sub(vault.accumulated_protocol_fees_sol);
+
+    let available_usdc = ctx
+        .accounts
+        .usdc_treasury
+        .amount
+        .saturating_sub(vault.accumulated_protocol_fees_usdc);
+
     require!(
-        sol_to_withdraw <= actual_sol,
+        sol_to_withdraw <= available_sol,
         VaultError::WithdrawalExceedsTreasury
     );
     require!(
-        usdc_to_withdraw <= actual_usdc,
+        usdc_to_withdraw <= available_usdc,
         VaultError::WithdrawalExceedsTreasury
     );
 
-    // Burn shares
-    let cpi_accounts = Burn {
-        mint: ctx.accounts.share_mint.to_account_info(),
-        from: ctx.accounts.user_share_account.to_account_info(),
-        authority: ctx.accounts.user.to_account_info(),
-    };
-    let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
-    token::burn(cpi_ctx, shares_amount)?;
+    // ── Burn shares ───────────────────────────────────────────────────────────
+    token::burn(
+        CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            Burn {
+                mint: ctx.accounts.share_mint.to_account_info(),
+                from: ctx.accounts.user_share_account.to_account_info(),
+                authority: ctx.accounts.user.to_account_info(),
+            },
+        ),
+        shares_amount,
+    )?;
 
-    // Transfer SOL from treasury to user
+    // ── Transfer SOL (wSOL) from treasury to user ─────────────────────────────
     if sol_to_withdraw > 0 {
         let vault_key = vault.key();
-        let seeds = &[
-            seeds::SOL_TREASURY,
-            vault_key.as_ref(),
-            &[vault.sol_treasury_bump],
-        ];
-        let signer_seeds = &[&seeds[..]];
-
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.sol_treasury.to_account_info(),
-            to: ctx.accounts.user_wsol_account.to_account_info(),
-            authority: ctx.accounts.sol_treasury.to_account_info(),
-        };
-        let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            cpi_accounts,
-            signer_seeds,
-        );
-        token::transfer(cpi_ctx, sol_to_withdraw)?;
+        let seeds = &[seeds::SOL_TREASURY, vault_key.as_ref(), &[vault.sol_treasury_bump]];
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.sol_treasury.to_account_info(),
+                    to: ctx.accounts.user_wsol_account.to_account_info(),
+                    authority: ctx.accounts.sol_treasury.to_account_info(),
+                },
+                &[&seeds[..]],
+            ),
+            sol_to_withdraw,
+        )?;
     }
 
-    // Transfer USDC from treasury to user
+    // ── Transfer USDC from treasury to user ───────────────────────────────────
     if usdc_to_withdraw > 0 {
         let vault_key = vault.key();
         let seeds = &[
@@ -174,36 +203,45 @@ pub fn handler(ctx: Context<Withdraw>) -> Result<()> {
             vault_key.as_ref(),
             &[vault.usdc_treasury_bump],
         ];
-        let signer_seeds = &[&seeds[..]];
-
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.usdc_treasury.to_account_info(),
-            to: ctx.accounts.user_usdc_account.to_account_info(),
-            authority: ctx.accounts.usdc_treasury.to_account_info(),
-        };
-        let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            cpi_accounts,
-            signer_seeds,
-        );
-        token::transfer(cpi_ctx, usdc_to_withdraw)?;
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.usdc_treasury.to_account_info(),
+                    to: ctx.accounts.user_usdc_account.to_account_info(),
+                    authority: ctx.accounts.usdc_treasury.to_account_info(),
+                },
+                &[&seeds[..]],
+            ),
+            usdc_to_withdraw,
+        )?;
     }
 
-    // Update vault state — M-03: proper error handling
+    // ── Update vault accounting ───────────────────────────────────────────────
+    //
+    // Only treasury and total_shares change.
+    // position_sol / position_usdc are intentionally NOT reduced here because
+    // they represent the full Raydium position shared by ALL holders.
+    // The treasury buffer "fronts" the position portion of this withdrawal;
+    // when close_position later returns all position funds the maths resolves
+    // correctly:
+    //
+    //   Example: treasury=2, position=8, shares=1000
+    //   User withdraws 10% (100 shares) → entitled to 1 SOL → treasury: 2→1
+    //   position_sol stays 8.  900 remaining shares × (1+8)/900 = 0.01 SOL ✓
+    //   close_position returns 8 SOL → treasury=9, position=0
+    //   900 shares × 9/900 = 0.01 SOL ✓  (total paid out = 1+9 = 10 = original)
     vault.treasury_sol = vault.treasury_sol.saturating_sub(sol_to_withdraw);
     vault.treasury_usdc = vault.treasury_usdc.saturating_sub(usdc_to_withdraw);
-    vault.total_shares = vault.total_shares
+    vault.total_shares = vault
+        .total_shares
         .checked_sub(shares_amount)
         .ok_or(error!(VaultError::MathOverflow))?;
-    vault.tvl_usd = vault.tvl_usd.saturating_sub(withdrawal_value_usd);
 
-    // Update user deposit record
-    user_deposit.shares = user_deposit.shares
+    // ── Update user deposit record ────────────────────────────────────────────
+    user_deposit.shares = user_deposit
+        .shares
         .checked_sub(shares_amount)
-        .ok_or(error!(VaultError::MathOverflow))?;
-    user_deposit.total_withdrawn_usd = user_deposit
-        .total_withdrawn_usd
-        .checked_add(withdrawal_value_usd)
         .ok_or(error!(VaultError::MathOverflow))?;
     user_deposit.updated_at = current_time;
 
@@ -212,7 +250,7 @@ pub fn handler(ctx: Context<Withdraw>) -> Result<()> {
         shares_burned: shares_amount,
         sol_withdrawn: sol_to_withdraw,
         usdc_withdrawn: usdc_to_withdraw,
-        withdrawal_value_usd,
+        withdrawal_value_usd: 0, // calculated off-chain using oracle price
     });
 
     Ok(())

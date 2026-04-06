@@ -3,9 +3,11 @@ use anchor_lang::prelude::*;
 #[event]
 pub struct VaultInitialized {
     pub admin: Pubkey,
+    pub protocol_wallet: Pubkey,
     pub share_mint: Pubkey,
     pub sol_treasury: Pubkey,
     pub usdc_treasury: Pubkey,
+    pub sol_price_feed: Pubkey,
 }
 
 #[event]
@@ -16,6 +18,7 @@ pub struct DepositSolEvent {
     pub shares_minted: u64,
     pub total_shares: u64,
     pub tvl_usd: u64,
+    pub sol_price_usd: u64,
 }
 
 #[event]
@@ -34,28 +37,6 @@ pub struct WithdrawEvent {
     pub sol_withdrawn: u64,
     pub usdc_withdrawn: u64,
     pub withdrawal_value_usd: u64,
-}
-
-#[event]
-pub struct TvlUpdated {
-    pub old_tvl: u64,
-    pub new_tvl: u64,
-    pub sol_price: u64,
-    pub share_price: u64,
-}
-
-#[event]
-pub struct WithdrawToManageEvent {
-    pub admin: Pubkey,
-    pub sol_amount: u64,
-    pub usdc_amount: u64,
-}
-
-#[event]
-pub struct ReturnFromManageEvent {
-    pub admin: Pubkey,
-    pub sol_amount: u64,
-    pub usdc_amount: u64,
 }
 
 #[event]
@@ -99,8 +80,21 @@ pub struct LiquidityDecreased {
 
 #[event]
 pub struct FeesCollected {
-    pub sol_fees: u64,
-    pub usdc_fees: u64,
+    /// Total SOL fees collected from Raydium
+    pub total_sol_fees: u64,
+    /// Total USDC fees collected from Raydium
+    pub total_usdc_fees: u64,
+    /// SOL fees allocated to protocol (10%)
+    pub protocol_sol_fees: u64,
+    /// USDC fees allocated to protocol (10%)
+    pub protocol_usdc_fees: u64,
+}
+
+#[event]
+pub struct ProtocolFeeExtracted {
+    pub sol_amount: u64,
+    pub usdc_amount: u64,
+    pub protocol_wallet: Pubkey,
 }
 
 #[event]
@@ -118,4 +112,9 @@ pub struct AdminTransferProposed {
 pub struct AdminTransferAccepted {
     pub old_admin: Pubkey,
     pub new_admin: Pubkey,
+}
+
+#[event]
+pub struct PriceFeedUpdated {
+    pub raydium_pool: Pubkey,
 }

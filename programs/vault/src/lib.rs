@@ -4,10 +4,11 @@ pub mod state;
 pub mod instructions;
 pub mod errors;
 pub mod events;
+pub mod constants;
 
 use instructions::*;
 
-declare_id!("6wktAqahNmWdF14B4UQYam7bskj1fUcMQQXaE2jmTYNz");
+declare_id!("DSNXFCkn4y6FSzfDmkZhNp3r23KdCvZ1fQMKRVXXZEMy");
 
 #[program]
 pub mod vault {
@@ -15,12 +16,16 @@ pub mod vault {
 
     // ============ ADMIN INSTRUCTIONS ============
 
-    /// Initialize vault with treasury PDAs and share mint
-    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
-        instructions::initialize::handler(ctx)
+    /// Initialize vault with treasury PDAs, share mint, protocol wallet, and Pyth price feed
+    pub fn initialize(
+        ctx: Context<Initialize>,
+        protocol_wallet: Pubkey,
+        sol_price_feed: Pubkey,
+    ) -> Result<()> {
+        instructions::initialize::handler(ctx, protocol_wallet, sol_price_feed)
     }
 
-    /// Pause or unpause the vault
+    /// Pause or unpause the vault (user deposits/withdrawals)
     pub fn set_paused(ctx: Context<SetPaused>, paused: bool) -> Result<()> {
         instructions::set_paused::handler(ctx, paused)
     }
@@ -35,31 +40,40 @@ pub mod vault {
         instructions::accept_admin::handler(ctx)
     }
 
-    /// Update TVL (called by backend periodically)
-    pub fn update_tvl(ctx: Context<UpdateTvl>, tvl_usd: u64, sol_price: u64) -> Result<()> {
-        instructions::update_tvl::handler(ctx, tvl_usd, sol_price)
+    /// Extract accumulated protocol fees (10% of collected fees) to protocol_wallet
+    pub fn extract_protocol_fee(ctx: Context<ExtractProtocolFee>) -> Result<()> {
+        instructions::extract_protocol_fee::handler(ctx)
     }
 
-    /// Withdraw funds from treasury to admin wallet for Raydium management
-    pub fn withdraw_to_manage(
-        ctx: Context<WithdrawToManage>,
-        sol_amount: u64,
-        usdc_amount: u64,
+    /// Emergency: cancel a stuck rebalance (if open_position fails after close_position).
+    /// Resets is_rebalancing = false so users can withdraw. Admin only.
+    pub fn cancel_rebalance(ctx: Context<CancelRebalance>) -> Result<()> {
+        instructions::cancel_rebalance::handler(ctx)
+    }
+
+    /// One-time migration: upgrades vault account layout after program upgrade.
+    /// Reallocs to Vault::LEN, preserves discriminator, sources state from
+    /// actual on-chain token accounts. Admin only.
+    pub fn migrate_vault(
+        ctx: Context<MigrateVault>,
+        protocol_wallet: Pubkey,
+        sol_price_feed: Pubkey,
     ) -> Result<()> {
-        instructions::withdraw_to_manage::handler(ctx, sol_amount, usdc_amount)
+        instructions::migrate_vault::handler(ctx, protocol_wallet, sol_price_feed)
     }
 
-    /// Return funds to treasury after rebalance
-    pub fn return_from_manage(
-        ctx: Context<ReturnFromManage>,
-        sol_amount: u64,
-        usdc_amount: u64,
-    ) -> Result<()> {
-        instructions::return_from_manage::handler(ctx, sol_amount, usdc_amount)
+    /// Set Raydium CLMM pool as SOL price source (admin-only, called once after upgrade).
+    /// raydium_pool: SOL/USDC Raydium CLMM pool address
+    pub fn sync_position_value(ctx: Context<SyncPositionValue>) -> Result<()> {
+        instructions::sync_position_value::sync_handler(ctx)
     }
 
-    /// Swap tokens within treasury via Raydium CLMM CPI
-    /// This allows rebalancing without moving funds to admin wallet
+    /// Update price feed address stored in vault
+    pub fn update_price(ctx: Context<UpdatePrice>, raydium_pool: Pubkey) -> Result<()> {
+        instructions::update_price::handler(ctx, raydium_pool)
+    }
+
+    /// Swap tokens within treasury via Raydium CLMM CPI (for rebalancing)
     pub fn swap_in_treasury<'a, 'b, 'c: 'info, 'info>(
         ctx: Context<'a, 'b, 'c, 'info, SwapInTreasury<'info>>,
         amount_in: u64,
@@ -71,7 +85,8 @@ pub mod vault {
 
     // ============ POSITION MANAGEMENT ============
 
-    /// Open a new CLMM position with funds from treasury
+    /// Open a new CLMM position with funds from treasury.
+    /// Also clears is_rebalancing flag (end of rebalance cycle).
     pub fn open_position<'a, 'b, 'c: 'info, 'info>(
         ctx: Context<'a, 'b, 'c, 'info, OpenPosition<'info>>,
         tick_lower_index: i32,
@@ -94,8 +109,13 @@ pub mod vault {
         )
     }
 
-    /// Close the active CLMM position and return funds to treasury
-    pub fn close_position(ctx: Context<ClosePosition>, amount_0_min: u64, amount_1_min: u64) -> Result<()> {
+    /// Close the active CLMM position and return funds to treasury.
+    /// Sets is_rebalancing = true (blocks user deposits/withdrawals until open_position).
+    pub fn close_position<'a, 'b, 'c: 'info, 'info>(
+        ctx: Context<'a, 'b, 'c, 'info, ClosePosition<'info>>,
+        amount_0_min: u64,
+        amount_1_min: u64,
+    ) -> Result<()> {
         instructions::close_position::handler(ctx, amount_0_min, amount_1_min)
     }
 
@@ -110,8 +130,8 @@ pub mod vault {
     }
 
     /// Decrease liquidity from the active position
-    pub fn decrease_liquidity(
-        ctx: Context<DecreaseLiquidity>,
+    pub fn decrease_liquidity<'a, 'b, 'c: 'info, 'info>(
+        ctx: Context<'a, 'b, 'c, 'info, DecreaseLiquidity<'info>>,
         liquidity: u128,
         amount_0_min: u64,
         amount_1_min: u64,
@@ -119,24 +139,25 @@ pub mod vault {
         instructions::decrease_liquidity::handler(ctx, liquidity, amount_0_min, amount_1_min)
     }
 
-    /// Collect accumulated trading fees from the position
+    /// Collect accumulated trading fees from the position.
+    /// 10% of fees → accumulated_protocol_fees. 90% stays in treasury (user profit).
     pub fn collect_fees(ctx: Context<CollectFees>) -> Result<()> {
         instructions::collect_fees::handler(ctx)
     }
 
     // ============ USER INSTRUCTIONS ============
 
-    /// Deposit SOL into vault
+    /// Deposit SOL into vault (price read live from Raydium pool)
     pub fn deposit_sol(ctx: Context<DepositSol>, amount: u64) -> Result<()> {
         instructions::deposit_sol::handler(ctx, amount)
     }
 
-    /// Deposit USDC into vault
+    /// Deposit USDC into vault (price read live from Raydium pool)
     pub fn deposit_usdc(ctx: Context<DepositUsdc>, amount: u64) -> Result<()> {
         instructions::deposit_usdc::handler(ctx, amount)
     }
 
-    /// Full withdrawal from vault (burn ALL shares, receive SOL/USDC)
+    /// Full withdrawal from vault (burn ALL shares, receive SOL/USDC pro-rata)
     pub fn withdraw(ctx: Context<Withdraw>) -> Result<()> {
         instructions::withdraw::handler(ctx)
     }

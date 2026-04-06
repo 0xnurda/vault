@@ -22,6 +22,8 @@ pub struct TransferAdmin<'info> {
 }
 
 pub fn handler(ctx: Context<TransferAdmin>, new_admin: Pubkey) -> Result<()> {
+    require!(new_admin != Pubkey::default(), VaultError::Unauthorized);
+
     let vault = &mut ctx.accounts.vault;
     vault.pending_admin = new_admin;
 

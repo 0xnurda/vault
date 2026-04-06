@@ -14,9 +14,6 @@ pub enum VaultError {
     #[msg("Insufficient treasury balance")]
     InsufficientTreasuryBalance,
 
-    #[msg("TVL is stale: update required before operation")]
-    StaleTvl,
-
     #[msg("Math overflow")]
     MathOverflow,
 
@@ -26,11 +23,11 @@ pub enum VaultError {
     #[msg("Vault is paused")]
     VaultPaused,
 
-    #[msg("Withdrawal amount exceeds available treasury")]
-    WithdrawalExceedsTreasury,
+    #[msg("Vault is currently rebalancing, try again shortly")]
+    RebalancingInProgress,
 
-    #[msg("Invalid SOL price")]
-    InvalidSolPrice,
+    #[msg("Withdrawal exceeds available treasury — admin must call decrease_liquidity or close_position first")]
+    WithdrawalExceedsTreasury,
 
     #[msg("Position already exists")]
     PositionAlreadyExists,
@@ -41,9 +38,33 @@ pub enum VaultError {
     #[msg("Invalid position")]
     InvalidPosition,
 
-    #[msg("TVL change exceeds 20% limit per update")]
-    TvlChangeExceeded,
-
     #[msg("No pending admin transfer")]
     NoPendingAdmin,
+
+    #[msg("Oracle price is stale (older than 60 seconds)")]
+    StaleOraclePrice,
+
+    #[msg("Oracle price is invalid (zero or negative)")]
+    InvalidOraclePrice,
+
+    #[msg("No protocol fees accumulated to extract")]
+    NoFeesToExtract,
+
+    #[msg("Invalid tick range: tick_lower must be less than tick_upper")]
+    InvalidTickRange,
+
+    #[msg("Deposit amount too small (below minimum)")]
+    DepositTooSmall,
+
+    #[msg("Vault is not currently rebalancing")]
+    NotRebalancing,
+
+    #[msg("SOL price not set — admin must call update_price first")]
+    SolPriceNotSet,
+
+    #[msg("Invalid SOL price: must be greater than zero")]
+    InvalidSolPrice,
+
+    #[msg("Invalid price feed: must be the Raydium CLMM pool set by admin")]
+    InvalidPriceFeed,
 }

@@ -118,6 +118,51 @@ pub fn handler(
     let sol_before = ctx.accounts.sol_treasury.amount;
     let usdc_before = ctx.accounts.usdc_treasury.amount;
 
+    // Treasury accounts are self-authority PDAs (token::authority = sol_treasury).
+    // Raydium IncreaseLiquidityV2 uses nft_owner (vault PDA) as transfer authority.
+    // So we approve the vault PDA as delegate on both treasuries before CPI,
+    // then revoke after — same pattern as open_position.rs.
+    let sol_treasury_seeds: &[&[u8]] = &[
+        seeds::SOL_TREASURY,
+        &ctx.accounts.vault.key().to_bytes(),
+        &[vault.sol_treasury_bump],
+    ];
+    let usdc_treasury_seeds: &[&[u8]] = &[
+        seeds::USDC_TREASURY,
+        &ctx.accounts.vault.key().to_bytes(),
+        &[vault.usdc_treasury_bump],
+    ];
+
+    if amount_0_max > 0 {
+        anchor_spl::token_interface::approve(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                anchor_spl::token_interface::Approve {
+                    to:        ctx.accounts.sol_treasury.to_account_info(),
+                    delegate:  ctx.accounts.vault.to_account_info(),
+                    authority: ctx.accounts.sol_treasury.to_account_info(),
+                },
+                &[sol_treasury_seeds],
+            ),
+            amount_0_max,
+        )?;
+    }
+
+    if amount_1_max > 0 {
+        anchor_spl::token_interface::approve(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                anchor_spl::token_interface::Approve {
+                    to:        ctx.accounts.usdc_treasury.to_account_info(),
+                    delegate:  ctx.accounts.vault.to_account_info(),
+                    authority: ctx.accounts.usdc_treasury.to_account_info(),
+                },
+                &[usdc_treasury_seeds],
+            ),
+            amount_1_max,
+        )?;
+    }
+
     // Build signer seeds for vault PDA
     let vault_seeds: &[&[&[u8]]] = &[&[
         seeds::VAULT,
@@ -156,6 +201,33 @@ pub fn handler(
     // Reload treasuries
     ctx.accounts.sol_treasury.reload()?;
     ctx.accounts.usdc_treasury.reload()?;
+
+    // Revoke delegations (security: don't leave open delegations)
+    if amount_0_max > 0 {
+        anchor_spl::token_interface::revoke(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                anchor_spl::token_interface::Revoke {
+                    source:    ctx.accounts.sol_treasury.to_account_info(),
+                    authority: ctx.accounts.sol_treasury.to_account_info(),
+                },
+                &[sol_treasury_seeds],
+            ),
+        )?;
+    }
+
+    if amount_1_max > 0 {
+        anchor_spl::token_interface::revoke(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                anchor_spl::token_interface::Revoke {
+                    source:    ctx.accounts.usdc_treasury.to_account_info(),
+                    authority: ctx.accounts.usdc_treasury.to_account_info(),
+                },
+                &[usdc_treasury_seeds],
+            ),
+        )?;
+    }
 
     // M-06: Calculate actual amounts used (before - after)
     let sol_used = sol_before.saturating_sub(ctx.accounts.sol_treasury.amount);

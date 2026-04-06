@@ -115,6 +115,7 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     amount_0_max: u64,
     amount_1_max: u64,
 ) -> Result<()> {
+    require!(tick_lower_index < tick_upper_index, VaultError::InvalidTickRange);
     require!(liquidity > 0 || amount_0_max > 0, VaultError::InvalidAmount);
 
     let vault = &ctx.accounts.vault;
@@ -271,6 +272,8 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     vault.position_usdc = usdc_used;
     vault.treasury_sol = ctx.accounts.sol_treasury.amount;
     vault.treasury_usdc = ctx.accounts.usdc_treasury.amount;
+    // ARCH-001: rebalance complete, unblock user deposits/withdrawals
+    vault.is_rebalancing = false;
 
     emit!(PositionOpened {
         position_mint: ctx.accounts.position_nft_mint.key(),

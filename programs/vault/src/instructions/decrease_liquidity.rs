@@ -96,12 +96,16 @@ pub struct DecreaseLiquidity<'info> {
     pub memo_program: Program<'info, Memo>,
 }
 
-pub fn handler(
-    ctx: Context<DecreaseLiquidity>,
+pub fn handler<'a, 'b, 'c: 'info, 'info>(
+    ctx: Context<'a, 'b, 'c, 'info, DecreaseLiquidity<'info>>,
     liquidity: u128,
     amount_0_min: u64,
     amount_1_min: u64,
 ) -> Result<()> {
+    // Collect remaining_accounts before any other borrows from ctx to avoid lifetime conflicts.
+    // Raydium needs reward token accounts forwarded as remaining_accounts.
+    let remaining = ctx.remaining_accounts.to_vec();
+
     let vault = &ctx.accounts.vault;
 
     require!(liquidity > 0, VaultError::InvalidAmount);
@@ -144,7 +148,8 @@ pub fn handler(
         ctx.accounts.clmm_program.to_account_info(),
         cpi_accounts,
         vault_seeds,
-    );
+    )
+    .with_remaining_accounts(remaining);
 
     // Execute CPI to decrease liquidity
     cpi::decrease_liquidity_v2(cpi_ctx, liquidity, amount_0_min, amount_1_min)?;

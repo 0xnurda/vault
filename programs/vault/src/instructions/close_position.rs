@@ -61,6 +61,7 @@ pub struct ClosePosition<'info> {
     #[account(
         mut,
         constraint = position_nft_account.amount == 1,
+        constraint = position_nft_account.mint == vault.position_mint @ VaultError::InvalidPosition,
     )]
     pub position_nft_account: Box<InterfaceAccount<'info, TokenAccount>>,
 
@@ -104,7 +105,12 @@ pub struct ClosePosition<'info> {
     pub system_program: Program<'info, System>,
 }
 
-pub fn handler(ctx: Context<ClosePosition>, amount_0_min: u64, amount_1_min: u64) -> Result<()> {
+pub fn handler<'a, 'b, 'c: 'info, 'info>(ctx: Context<'a, 'b, 'c, 'info, ClosePosition<'info>>, amount_0_min: u64, amount_1_min: u64) -> Result<()> {
+    // Collect remaining_accounts before any other borrows from ctx to avoid lifetime conflicts.
+    // These are the reward token accounts required by Raydium's decrease_liquidity_v2
+    // when the pool has initialized rewards: [userRewardAta, rewardVault] per reward.
+    let remaining = ctx.remaining_accounts.to_vec();
+
     let vault = &ctx.accounts.vault;
     // Use actual liquidity from personal_position, not stored value
     let liquidity = ctx.accounts.personal_position.liquidity;
@@ -136,11 +142,13 @@ pub fn handler(ctx: Context<ClosePosition>, amount_0_min: u64, amount_1_min: u64
             vault_1_mint: ctx.accounts.vault_1_mint.to_account_info(),
         };
 
+        // Forward remaining_accounts so Raydium receives reward token accounts
+        // (required by decrease_liquidity_v2 when pool has initialized rewards).
         let decrease_ctx = CpiContext::new_with_signer(
             ctx.accounts.clmm_program.to_account_info(),
             decrease_accounts,
             vault_seeds,
-        );
+        ).with_remaining_accounts(remaining);
 
         // H-02: Use slippage params instead of 0
         cpi::decrease_liquidity_v2(decrease_ctx, liquidity, amount_0_min, amount_1_min)?;
@@ -180,6 +188,9 @@ pub fn handler(ctx: Context<ClosePosition>, amount_0_min: u64, amount_1_min: u64
     vault.position_usdc = 0;
     vault.treasury_sol = ctx.accounts.sol_treasury.amount;
     vault.treasury_usdc = ctx.accounts.usdc_treasury.amount;
+    // ARCH-001: block user deposits/withdrawals during rebalance window
+    // Will be cleared by open_position when new position is opened
+    vault.is_rebalancing = true;
 
     emit!(PositionClosed {
         treasury_sol: vault.treasury_sol,
