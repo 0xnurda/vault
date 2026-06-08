@@ -13,79 +13,62 @@ use crate::state::{seeds, Vault};
 
 #[derive(Accounts)]
 pub struct IncreaseLiquidity<'info> {
-    /// Admin increasing liquidity
     #[account(mut)]
     pub admin: Signer<'info>,
 
-    /// Vault state
     #[account(
         mut,
-        seeds = [seeds::VAULT],
+        seeds = [seeds::VAULT, vault.pool_id.as_ref()],
         bump = vault.bump,
         constraint = vault.admin == admin.key() @ VaultError::Unauthorized,
         constraint = vault.has_active_position @ VaultError::NoActivePosition,
     )]
     pub vault: Box<Account<'info, Vault>>,
 
-    /// SOL treasury PDA (source for token0)
     #[account(
         mut,
-        seeds = [seeds::SOL_TREASURY, vault.key().as_ref()],
-        bump = vault.sol_treasury_bump,
+        seeds = [seeds::TOKEN0_TREASURY, vault.key().as_ref()],
+        bump = vault.token0_treasury_bump,
     )]
-    pub sol_treasury: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token0_treasury: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    /// USDC treasury PDA (source for token1)
     #[account(
         mut,
-        seeds = [seeds::USDC_TREASURY, vault.key().as_ref()],
-        bump = vault.usdc_treasury_bump,
+        seeds = [seeds::TOKEN1_TREASURY, vault.key().as_ref()],
+        bump = vault.token1_treasury_bump,
     )]
-    pub usdc_treasury: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token1_treasury: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    // ============ Raydium CLMM accounts ============
-
-    /// Pool state
     #[account(mut)]
     pub pool_state: AccountLoader<'info, PoolState>,
 
-    /// Position NFT account (owned by vault)
     #[account(
         constraint = position_nft_account.amount == 1,
         constraint = position_nft_account.mint == vault.position_mint @ VaultError::InvalidPosition,
     )]
     pub position_nft_account: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    /// Personal position state
     #[account(
         mut,
         constraint = personal_position.pool_id == pool_state.key(),
     )]
     pub personal_position: Box<Account<'info, PersonalPositionState>>,
 
-    /// Token vault 0 (pool's SOL vault)
     #[account(mut)]
     pub token_vault_0: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    /// Token vault 1 (pool's USDC vault)
     #[account(mut)]
     pub token_vault_1: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    /// Tick array for lower bound
     #[account(mut)]
     pub tick_array_lower: AccountLoader<'info, TickArrayState>,
 
-    /// Tick array for upper bound
     #[account(mut)]
     pub tick_array_upper: AccountLoader<'info, TickArrayState>,
 
-    /// Mint of vault 0
     pub vault_0_mint: Box<InterfaceAccount<'info, Mint>>,
-
-    /// Mint of vault 1
     pub vault_1_mint: Box<InterfaceAccount<'info, Mint>>,
 
-    /// Raydium CLMM program
     /// CHECK: Validated by address constraint
     #[account(address = raydium_clmm_cpi::id())]
     pub clmm_program: UncheckedAccount<'info>,
@@ -94,43 +77,41 @@ pub struct IncreaseLiquidity<'info> {
     pub token_program_2022: Program<'info, Token2022>,
 }
 
+const MAX_SLIPPAGE_BPS: u16 = 500;
+
 pub fn handler(
     ctx: Context<IncreaseLiquidity>,
     liquidity: u128,
     amount_0_max: u64,
     amount_1_max: u64,
+    slippage_bps: u16,
 ) -> Result<()> {
     require!(liquidity > 0 || amount_0_max > 0, VaultError::InvalidAmount);
+    require!(slippage_bps <= MAX_SLIPPAGE_BPS, VaultError::SlippageTooHigh);
 
     let vault = &ctx.accounts.vault;
 
-    // Check treasury has enough funds
     require!(
-        ctx.accounts.sol_treasury.amount >= amount_0_max,
+        ctx.accounts.token0_treasury.amount >= amount_0_max,
         VaultError::InsufficientTreasuryBalance
     );
     require!(
-        ctx.accounts.usdc_treasury.amount >= amount_1_max,
+        ctx.accounts.token1_treasury.amount >= amount_1_max,
         VaultError::InsufficientTreasuryBalance
     );
 
-    // M-06: Save balances before CPI for accurate calculation
-    let sol_before = ctx.accounts.sol_treasury.amount;
-    let usdc_before = ctx.accounts.usdc_treasury.amount;
+    let token0_before = ctx.accounts.token0_treasury.amount;
+    let token1_before = ctx.accounts.token1_treasury.amount;
 
-    // Treasury accounts are self-authority PDAs (token::authority = sol_treasury).
-    // Raydium IncreaseLiquidityV2 uses nft_owner (vault PDA) as transfer authority.
-    // So we approve the vault PDA as delegate on both treasuries before CPI,
-    // then revoke after — same pattern as open_position.rs.
-    let sol_treasury_seeds: &[&[u8]] = &[
-        seeds::SOL_TREASURY,
+    let token0_treasury_seeds: &[&[u8]] = &[
+        seeds::TOKEN0_TREASURY,
         &ctx.accounts.vault.key().to_bytes(),
-        &[vault.sol_treasury_bump],
+        &[vault.token0_treasury_bump],
     ];
-    let usdc_treasury_seeds: &[&[u8]] = &[
-        seeds::USDC_TREASURY,
+    let token1_treasury_seeds: &[&[u8]] = &[
+        seeds::TOKEN1_TREASURY,
         &ctx.accounts.vault.key().to_bytes(),
-        &[vault.usdc_treasury_bump],
+        &[vault.token1_treasury_bump],
     ];
 
     if amount_0_max > 0 {
@@ -138,11 +119,11 @@ pub fn handler(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
                 anchor_spl::token_interface::Approve {
-                    to:        ctx.accounts.sol_treasury.to_account_info(),
+                    to:        ctx.accounts.token0_treasury.to_account_info(),
                     delegate:  ctx.accounts.vault.to_account_info(),
-                    authority: ctx.accounts.sol_treasury.to_account_info(),
+                    authority: ctx.accounts.token0_treasury.to_account_info(),
                 },
-                &[sol_treasury_seeds],
+                &[token0_treasury_seeds],
             ),
             amount_0_max,
         )?;
@@ -153,23 +134,19 @@ pub fn handler(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
                 anchor_spl::token_interface::Approve {
-                    to:        ctx.accounts.usdc_treasury.to_account_info(),
+                    to:        ctx.accounts.token1_treasury.to_account_info(),
                     delegate:  ctx.accounts.vault.to_account_info(),
-                    authority: ctx.accounts.usdc_treasury.to_account_info(),
+                    authority: ctx.accounts.token1_treasury.to_account_info(),
                 },
-                &[usdc_treasury_seeds],
+                &[token1_treasury_seeds],
             ),
             amount_1_max,
         )?;
     }
 
-    // Build signer seeds for vault PDA
-    let vault_seeds: &[&[&[u8]]] = &[&[
-        seeds::VAULT,
-        &[vault.bump],
-    ]];
+    let pool_id = vault.pool_id;
+    let vault_seeds: &[&[&[u8]]] = &[&[seeds::VAULT, pool_id.as_ref(), &[vault.bump]]];
 
-    // Build CPI context
     let cpi_accounts = cpi::accounts::IncreaseLiquidityV2 {
         nft_owner: ctx.accounts.vault.to_account_info(),
         nft_account: ctx.accounts.position_nft_account.to_account_info(),
@@ -178,8 +155,8 @@ pub fn handler(
         personal_position: ctx.accounts.personal_position.to_account_info(),
         tick_array_lower: ctx.accounts.tick_array_lower.to_account_info(),
         tick_array_upper: ctx.accounts.tick_array_upper.to_account_info(),
-        token_account_0: ctx.accounts.sol_treasury.to_account_info(),
-        token_account_1: ctx.accounts.usdc_treasury.to_account_info(),
+        token_account_0: ctx.accounts.token0_treasury.to_account_info(),
+        token_account_1: ctx.accounts.token1_treasury.to_account_info(),
         token_vault_0: ctx.accounts.token_vault_0.to_account_info(),
         token_vault_1: ctx.accounts.token_vault_1.to_account_info(),
         token_program: ctx.accounts.token_program.to_account_info(),
@@ -194,24 +171,19 @@ pub fn handler(
         vault_seeds,
     );
 
-    // Execute CPI to increase liquidity
-    // base_flag: Some(true) means calculate liquidity based on amount_0
-    cpi::increase_liquidity_v2(cpi_ctx, liquidity, amount_0_max, amount_1_max, Some(true))?;
+    // Save result WITHOUT `?` — must ALWAYS revoke regardless of CPI outcome.
+    let increase_result = cpi::increase_liquidity_v2(cpi_ctx, liquidity, amount_0_max, amount_1_max, Some(true));
 
-    // Reload treasuries
-    ctx.accounts.sol_treasury.reload()?;
-    ctx.accounts.usdc_treasury.reload()?;
-
-    // Revoke delegations (security: don't leave open delegations)
+    // ALWAYS revoke both delegations, even if CPI failed.
     if amount_0_max > 0 {
         anchor_spl::token_interface::revoke(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
                 anchor_spl::token_interface::Revoke {
-                    source:    ctx.accounts.sol_treasury.to_account_info(),
-                    authority: ctx.accounts.sol_treasury.to_account_info(),
+                    source:    ctx.accounts.token0_treasury.to_account_info(),
+                    authority: ctx.accounts.token0_treasury.to_account_info(),
                 },
-                &[sol_treasury_seeds],
+                &[token0_treasury_seeds],
             ),
         )?;
     }
@@ -221,33 +193,36 @@ pub fn handler(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
                 anchor_spl::token_interface::Revoke {
-                    source:    ctx.accounts.usdc_treasury.to_account_info(),
-                    authority: ctx.accounts.usdc_treasury.to_account_info(),
+                    source:    ctx.accounts.token1_treasury.to_account_info(),
+                    authority: ctx.accounts.token1_treasury.to_account_info(),
                 },
-                &[usdc_treasury_seeds],
+                &[token1_treasury_seeds],
             ),
         )?;
     }
 
-    // M-06: Calculate actual amounts used (before - after)
-    let sol_used = sol_before.saturating_sub(ctx.accounts.sol_treasury.amount);
-    let usdc_used = usdc_before.saturating_sub(ctx.accounts.usdc_treasury.amount);
+    // Now propagate the CPI result.
+    increase_result?;
 
-    // M-05: Read actual liquidity from personal_position after CPI
+    ctx.accounts.token0_treasury.reload()?;
+    ctx.accounts.token1_treasury.reload()?;
+
+    let token0_used = token0_before.saturating_sub(ctx.accounts.token0_treasury.amount);
+    let token1_used = token1_before.saturating_sub(ctx.accounts.token1_treasury.amount);
+
     ctx.accounts.personal_position.reload()?;
     let actual_liquidity = ctx.accounts.personal_position.liquidity;
 
-    // Update vault state
     let vault = &mut ctx.accounts.vault;
     vault.position_liquidity = actual_liquidity;
-    vault.position_sol = vault.position_sol.saturating_add(sol_used);
-    vault.position_usdc = vault.position_usdc.saturating_add(usdc_used);
-    vault.treasury_sol = ctx.accounts.sol_treasury.amount;
-    vault.treasury_usdc = ctx.accounts.usdc_treasury.amount;
+    vault.position_token0 = vault.position_token0.saturating_add(token0_used);
+    vault.position_token1 = vault.position_token1.saturating_add(token1_used);
+    vault.treasury_token0 = ctx.accounts.token0_treasury.amount;
+    vault.treasury_token1 = ctx.accounts.token1_treasury.amount;
 
     emit!(LiquidityIncreased {
-        sol_added: sol_used,
-        usdc_added: usdc_used,
+        token0_added: token0_used,
+        token1_added: token1_used,
         new_liquidity: vault.position_liquidity,
     });
 

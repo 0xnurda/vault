@@ -26,7 +26,7 @@ pub enum VaultError {
     #[msg("Vault is currently rebalancing, try again shortly")]
     RebalancingInProgress,
 
-    #[msg("Withdrawal exceeds available treasury — admin must call decrease_liquidity or close_position first")]
+    #[msg("Withdrawal exceeds available treasury — use withdraw_from_position when a position is active")]
     WithdrawalExceedsTreasury,
 
     #[msg("Position already exists")]
@@ -59,12 +59,12 @@ pub enum VaultError {
     #[msg("Vault is not currently rebalancing")]
     NotRebalancing,
 
-    #[msg("SOL price not set — admin must call update_price first")]
-    SolPriceNotSet,
-
-    #[msg("Invalid SOL price: must be greater than zero")]
-    InvalidSolPrice,
-
     #[msg("Invalid price feed: must be the Raydium CLMM pool set by admin")]
     InvalidPriceFeed,
+
+    #[msg("Slippage exceeds maximum allowed (500 bps / 5%)")]
+    SlippageTooHigh,
+
+    #[msg("Output below minimum: slippage tolerance exceeded")]
+    SlippageExceeded,
 }

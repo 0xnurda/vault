@@ -15,85 +15,66 @@ use crate::state::{seeds, Vault};
 #[derive(Accounts)]
 #[instruction(tick_lower_index: i32, tick_upper_index: i32, tick_array_lower_start_index: i32, tick_array_upper_start_index: i32)]
 pub struct OpenPosition<'info> {
-    /// Admin opening the position
     #[account(mut)]
     pub admin: Signer<'info>,
 
-    /// Vault state
     #[account(
         mut,
-        seeds = [seeds::VAULT],
+        seeds = [seeds::VAULT, vault.pool_id.as_ref()],
         bump = vault.bump,
         constraint = vault.admin == admin.key() @ VaultError::Unauthorized,
         constraint = !vault.has_active_position @ VaultError::PositionAlreadyExists,
     )]
     pub vault: Box<Account<'info, Vault>>,
 
-    /// SOL treasury PDA (source for token0)
     #[account(
         mut,
-        seeds = [seeds::SOL_TREASURY, vault.key().as_ref()],
-        bump = vault.sol_treasury_bump,
+        seeds = [seeds::TOKEN0_TREASURY, vault.key().as_ref()],
+        bump = vault.token0_treasury_bump,
     )]
-    pub sol_treasury: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token0_treasury: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    /// USDC treasury PDA (source for token1)
     #[account(
         mut,
-        seeds = [seeds::USDC_TREASURY, vault.key().as_ref()],
-        bump = vault.usdc_treasury_bump,
+        seeds = [seeds::TOKEN1_TREASURY, vault.key().as_ref()],
+        bump = vault.token1_treasury_bump,
     )]
-    pub usdc_treasury: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token1_treasury: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    // ============ Raydium CLMM accounts ============
-
-    /// Pool state
     #[account(mut)]
     pub pool_state: AccountLoader<'info, PoolState>,
 
-    /// Position NFT mint (will be created)
     #[account(mut)]
     pub position_nft_mint: Signer<'info>,
 
-    /// Position NFT account (vault will own the NFT)
     /// CHECK: Will be initialized by Raydium
     #[account(mut)]
     pub position_nft_account: UncheckedAccount<'info>,
 
-    /// Personal position state (created by Raydium)
     /// CHECK: Will be initialized by Raydium
     #[account(mut)]
     pub personal_position: UncheckedAccount<'info>,
 
-    /// Tick array for lower bound
     /// CHECK: Validated by Raydium
     #[account(mut)]
     pub tick_array_lower: UncheckedAccount<'info>,
 
-    /// Tick array for upper bound
     /// CHECK: Validated by Raydium
     #[account(mut)]
     pub tick_array_upper: UncheckedAccount<'info>,
 
-    /// Token vault 0 (pool's SOL vault)
     #[account(mut)]
     pub token_vault_0: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    /// Token vault 1 (pool's USDC vault)
     #[account(mut)]
     pub token_vault_1: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    /// Mint of vault 0
     pub vault_0_mint: Box<InterfaceAccount<'info, Mint>>,
-
-    /// Mint of vault 1
     pub vault_1_mint: Box<InterfaceAccount<'info, Mint>>,
 
-    /// Tick array bitmap extension
     /// CHECK: Validated by Raydium
     pub tick_array_bitmap: UncheckedAccount<'info>,
 
-    /// Raydium CLMM program
     /// CHECK: Validated by address constraint
     #[account(address = raydium_clmm_cpi::id())]
     pub clmm_program: UncheckedAccount<'info>,
@@ -105,6 +86,8 @@ pub struct OpenPosition<'info> {
     pub associated_token_program: Program<'info, AssociatedToken>,
 }
 
+const MAX_SLIPPAGE_BPS: u16 = 500;
+
 pub fn handler<'a, 'b, 'c: 'info, 'info>(
     ctx: Context<'a, 'b, 'c, 'info, OpenPosition<'info>>,
     tick_lower_index: i32,
@@ -114,74 +97,68 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     liquidity: u128,
     amount_0_max: u64,
     amount_1_max: u64,
+    slippage_bps: u16,
 ) -> Result<()> {
     require!(tick_lower_index < tick_upper_index, VaultError::InvalidTickRange);
     require!(liquidity > 0 || amount_0_max > 0, VaultError::InvalidAmount);
+    require!(slippage_bps <= MAX_SLIPPAGE_BPS, VaultError::SlippageTooHigh);
 
     let vault = &ctx.accounts.vault;
 
-    // Check treasury has enough funds
     require!(
-        ctx.accounts.sol_treasury.amount >= amount_0_max,
+        ctx.accounts.token0_treasury.amount >= amount_0_max,
         VaultError::InsufficientTreasuryBalance
     );
     require!(
-        ctx.accounts.usdc_treasury.amount >= amount_1_max,
+        ctx.accounts.token1_treasury.amount >= amount_1_max,
         VaultError::InsufficientTreasuryBalance
     );
 
-    // Build signer seeds for vault PDA
-    let vault_seeds: &[&[&[u8]]] = &[&[
-        seeds::VAULT,
-        &[vault.bump],
-    ]];
+    let pool_id = vault.pool_id;
+    let vault_seeds: &[&[&[u8]]] = &[&[seeds::VAULT, pool_id.as_ref(), &[vault.bump]]];
 
-    // H-04: Save balances before CPI for accurate position tracking
-    let sol_before = ctx.accounts.sol_treasury.amount;
-    let usdc_before = ctx.accounts.usdc_treasury.amount;
+    let token0_before = ctx.accounts.token0_treasury.amount;
+    let token1_before = ctx.accounts.token1_treasury.amount;
 
-    // Approve admin as delegate on treasury accounts so Raydium can use admin (payer) as authority
-    let sol_treasury_seeds: &[&[u8]] = &[
-        seeds::SOL_TREASURY,
+    let token0_treasury_seeds: &[&[u8]] = &[
+        seeds::TOKEN0_TREASURY,
         &ctx.accounts.vault.key().to_bytes(),
-        &[vault.sol_treasury_bump],
+        &[vault.token0_treasury_bump],
     ];
     anchor_spl::token_interface::approve(
         CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
             anchor_spl::token_interface::Approve {
-                to: ctx.accounts.sol_treasury.to_account_info(),
+                to: ctx.accounts.token0_treasury.to_account_info(),
                 delegate: ctx.accounts.admin.to_account_info(),
-                authority: ctx.accounts.sol_treasury.to_account_info(),
+                authority: ctx.accounts.token0_treasury.to_account_info(),
             },
-            &[sol_treasury_seeds],
+            &[token0_treasury_seeds],
         ),
         amount_0_max,
     )?;
 
-    let usdc_treasury_seeds: &[&[u8]] = &[
-        seeds::USDC_TREASURY,
+    let token1_treasury_seeds: &[&[u8]] = &[
+        seeds::TOKEN1_TREASURY,
         &ctx.accounts.vault.key().to_bytes(),
-        &[vault.usdc_treasury_bump],
+        &[vault.token1_treasury_bump],
     ];
     anchor_spl::token_interface::approve(
         CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
             anchor_spl::token_interface::Approve {
-                to: ctx.accounts.usdc_treasury.to_account_info(),
+                to: ctx.accounts.token1_treasury.to_account_info(),
                 delegate: ctx.accounts.admin.to_account_info(),
-                authority: ctx.accounts.usdc_treasury.to_account_info(),
+                authority: ctx.accounts.token1_treasury.to_account_info(),
             },
-            &[usdc_treasury_seeds],
+            &[token1_treasury_seeds],
         ),
         amount_1_max,
     )?;
 
-    // Build CPI context for opening position
-    // Admin is payer (for rent), vault owns the NFT, admin is delegated authority on treasuries
     let cpi_accounts = cpi::accounts::OpenPositionWithToken22Nft {
         payer: ctx.accounts.admin.to_account_info(),
-        position_nft_owner: ctx.accounts.vault.to_account_info(), // Vault owns the NFT
+        position_nft_owner: ctx.accounts.vault.to_account_info(),
         position_nft_mint: ctx.accounts.position_nft_mint.to_account_info(),
         position_nft_account: ctx.accounts.position_nft_account.to_account_info(),
         pool_state: ctx.accounts.pool_state.to_account_info(),
@@ -189,8 +166,8 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
         tick_array_lower: ctx.accounts.tick_array_lower.to_account_info(),
         tick_array_upper: ctx.accounts.tick_array_upper.to_account_info(),
         personal_position: ctx.accounts.personal_position.to_account_info(),
-        token_account_0: ctx.accounts.sol_treasury.to_account_info(),
-        token_account_1: ctx.accounts.usdc_treasury.to_account_info(),
+        token_account_0: ctx.accounts.token0_treasury.to_account_info(),
+        token_account_1: ctx.accounts.token1_treasury.to_account_info(),
         token_vault_0: ctx.accounts.token_vault_0.to_account_info(),
         token_vault_1: ctx.accounts.token_vault_1.to_account_info(),
         rent: ctx.accounts.rent.to_account_info(),
@@ -206,15 +183,12 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
         ctx.accounts.clmm_program.to_account_info(),
         cpi_accounts,
         vault_seeds,
-    );
+    )
+    .with_remaining_accounts(vec![ctx.accounts.tick_array_bitmap.to_account_info()]);
 
-    // Add remaining accounts (tick array bitmap)
-    let cpi_ctx = cpi_ctx.with_remaining_accounts(vec![
-        ctx.accounts.tick_array_bitmap.to_account_info(),
-    ]);
-
-    // Execute CPI to open position
-    cpi::open_position_with_token22_nft(
+    // Save CPI result WITHOUT `?` — we must ALWAYS revoke even if CPI fails,
+    // otherwise admin retains a live SPL delegate on the treasury accounts.
+    let open_result = cpi::open_position_with_token22_nft(
         cpi_ctx,
         tick_lower_index,
         tick_upper_index,
@@ -223,66 +197,64 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
         liquidity,
         amount_0_max,
         amount_1_max,
-        true, // with_metadata
-        Some(false), // base_flag: calculate from amount_1 (USDC)
-    )?;
+        true,
+        Some(false),
+    );
 
-    // H-05: Revoke delegations after CPI
+    // ALWAYS revoke — both on success and on failure.
     anchor_spl::token_interface::revoke(
         CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
             anchor_spl::token_interface::Revoke {
-                source: ctx.accounts.sol_treasury.to_account_info(),
-                authority: ctx.accounts.sol_treasury.to_account_info(),
+                source: ctx.accounts.token0_treasury.to_account_info(),
+                authority: ctx.accounts.token0_treasury.to_account_info(),
             },
-            &[sol_treasury_seeds],
+            &[token0_treasury_seeds],
         ),
     )?;
     anchor_spl::token_interface::revoke(
         CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
             anchor_spl::token_interface::Revoke {
-                source: ctx.accounts.usdc_treasury.to_account_info(),
-                authority: ctx.accounts.usdc_treasury.to_account_info(),
+                source: ctx.accounts.token1_treasury.to_account_info(),
+                authority: ctx.accounts.token1_treasury.to_account_info(),
             },
-            &[usdc_treasury_seeds],
+            &[token1_treasury_seeds],
         ),
     )?;
 
-    // Reload treasuries to get updated balances
-    ctx.accounts.sol_treasury.reload()?;
-    ctx.accounts.usdc_treasury.reload()?;
+    // Now propagate the CPI result.
+    open_result?;
 
-    // H-04: Calculate actual amounts used (before - after)
-    let sol_used = sol_before.saturating_sub(ctx.accounts.sol_treasury.amount);
-    let usdc_used = usdc_before.saturating_sub(ctx.accounts.usdc_treasury.amount);
+    ctx.accounts.token0_treasury.reload()?;
+    ctx.accounts.token1_treasury.reload()?;
 
-    // Update vault state
+    let token0_used = token0_before.saturating_sub(ctx.accounts.token0_treasury.amount);
+    let token1_used = token1_before.saturating_sub(ctx.accounts.token1_treasury.amount);
+
     let vault = &mut ctx.accounts.vault;
     vault.has_active_position = true;
     vault.position_mint = ctx.accounts.position_nft_mint.key();
-    vault.position_pool_id = ctx.accounts.pool_state.key();
     vault.position_tick_lower = tick_lower_index;
     vault.position_tick_upper = tick_upper_index;
-    // M-07: Read actual liquidity from personal_position after CPI (not the requested value)
     let position_data = ctx.accounts.personal_position.try_borrow_data()?;
     let personal_pos = PersonalPositionState::try_deserialize(&mut &position_data[..])?;
     vault.position_liquidity = personal_pos.liquidity;
-    vault.position_sol = sol_used;
-    vault.position_usdc = usdc_used;
-    vault.treasury_sol = ctx.accounts.sol_treasury.amount;
-    vault.treasury_usdc = ctx.accounts.usdc_treasury.amount;
-    // ARCH-001: rebalance complete, unblock user deposits/withdrawals
+    vault.position_token0 = token0_used;
+    vault.position_token1 = token1_used;
+    vault.treasury_token0 = ctx.accounts.token0_treasury.amount;
+    vault.treasury_token1 = ctx.accounts.token1_treasury.amount;
     vault.is_rebalancing = false;
+    vault.rebalance_started_at = 0;
 
     emit!(PositionOpened {
         position_mint: ctx.accounts.position_nft_mint.key(),
-        pool_id: vault.position_pool_id,
+        pool_id: vault.pool_id,
         tick_lower: tick_lower_index,
         tick_upper: tick_upper_index,
         liquidity: vault.position_liquidity,
-        sol_used: vault.position_sol,
-        usdc_used: vault.position_usdc,
+        token0_used: vault.position_token0,
+        token1_used: vault.position_token1,
     });
 
     Ok(())

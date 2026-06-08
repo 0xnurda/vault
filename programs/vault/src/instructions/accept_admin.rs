@@ -14,7 +14,7 @@ pub struct AcceptAdmin<'info> {
     /// Vault state
     #[account(
         mut,
-        seeds = [seeds::VAULT],
+        seeds = [seeds::VAULT, vault.pool_id.as_ref()],
         bump = vault.bump,
         constraint = vault.pending_admin == new_admin.key() @ VaultError::NoPendingAdmin,
     )]

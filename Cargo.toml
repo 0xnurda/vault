@@ -9,6 +9,7 @@ ahash = { git = "https://github.com/tkaitchuck/aHash", tag = "v0.8.11" }
 
 [profile.release]
 overflow-checks = true
+opt-level = "z"     # optimize for size (reduces binary ~15-25%)
 lto = "fat"
 codegen-units = 1
 

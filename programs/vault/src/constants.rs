@@ -9,8 +9,8 @@ pub const RAYDIUM_CLMM_PROGRAM_ID: Pubkey =
 pub const WSOL_MINT: Pubkey =
     pubkey!("So11111111111111111111111111111111111111112");
 
-/// Minimum SOL deposit: 0.001 SOL (anti-dust, prevents rounding to 0 shares)
-pub const MIN_DEPOSIT_SOL: u64 = 1_000_000; // lamports
+/// Minimum token0 deposit (anti-dust, prevents rounding to 0 shares)
+pub const MIN_DEPOSIT_TOKEN0: u64 = 1_000; // raw units
 
-/// Minimum USDC deposit: 1 USDC (anti-dust)
-pub const MIN_DEPOSIT_USDC: u64 = 1_000_000; // 6 decimals
+/// Minimum token1 deposit (anti-dust)
+pub const MIN_DEPOSIT_TOKEN1: u64 = 1_000; // raw units

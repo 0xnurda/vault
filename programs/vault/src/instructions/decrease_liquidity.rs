@@ -14,79 +14,62 @@ use crate::state::{seeds, Vault};
 
 #[derive(Accounts)]
 pub struct DecreaseLiquidity<'info> {
-    /// Admin decreasing liquidity
     #[account(mut)]
     pub admin: Signer<'info>,
 
-    /// Vault state
     #[account(
         mut,
-        seeds = [seeds::VAULT],
+        seeds = [seeds::VAULT, vault.pool_id.as_ref()],
         bump = vault.bump,
         constraint = vault.admin == admin.key() @ VaultError::Unauthorized,
         constraint = vault.has_active_position @ VaultError::NoActivePosition,
     )]
     pub vault: Box<Account<'info, Vault>>,
 
-    /// SOL treasury PDA (destination for token0)
     #[account(
         mut,
-        seeds = [seeds::SOL_TREASURY, vault.key().as_ref()],
-        bump = vault.sol_treasury_bump,
+        seeds = [seeds::TOKEN0_TREASURY, vault.key().as_ref()],
+        bump = vault.token0_treasury_bump,
     )]
-    pub sol_treasury: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token0_treasury: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    /// USDC treasury PDA (destination for token1)
     #[account(
         mut,
-        seeds = [seeds::USDC_TREASURY, vault.key().as_ref()],
-        bump = vault.usdc_treasury_bump,
+        seeds = [seeds::TOKEN1_TREASURY, vault.key().as_ref()],
+        bump = vault.token1_treasury_bump,
     )]
-    pub usdc_treasury: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token1_treasury: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    // ============ Raydium CLMM accounts ============
-
-    /// Pool state
     #[account(mut)]
     pub pool_state: AccountLoader<'info, PoolState>,
 
-    /// Position NFT account (owned by vault)
     #[account(
         constraint = position_nft_account.amount == 1,
         constraint = position_nft_account.mint == vault.position_mint @ VaultError::InvalidPosition,
     )]
     pub position_nft_account: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    /// Personal position state
     #[account(
         mut,
         constraint = personal_position.pool_id == pool_state.key(),
     )]
     pub personal_position: Box<Account<'info, PersonalPositionState>>,
 
-    /// Token vault 0 (pool's SOL vault)
     #[account(mut)]
     pub token_vault_0: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    /// Token vault 1 (pool's USDC vault)
     #[account(mut)]
     pub token_vault_1: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    /// Tick array for lower bound
     #[account(mut)]
     pub tick_array_lower: AccountLoader<'info, TickArrayState>,
 
-    /// Tick array for upper bound
     #[account(mut)]
     pub tick_array_upper: AccountLoader<'info, TickArrayState>,
 
-    /// Mint of vault 0
     pub vault_0_mint: Box<InterfaceAccount<'info, Mint>>,
-
-    /// Mint of vault 1
     pub vault_1_mint: Box<InterfaceAccount<'info, Mint>>,
 
-    /// Raydium CLMM program
     /// CHECK: Validated by address constraint
     #[account(address = raydium_clmm_cpi::id())]
     pub clmm_program: UncheckedAccount<'info>,
@@ -102,8 +85,8 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     amount_0_min: u64,
     amount_1_min: u64,
 ) -> Result<()> {
-    // Collect remaining_accounts before any other borrows from ctx to avoid lifetime conflicts.
-    // Raydium needs reward token accounts forwarded as remaining_accounts.
+    // Must clone remaining_accounts before any borrow of ctx.
+    // Both CPIs need them (reward token accounts for pools with initialized rewards).
     let remaining = ctx.remaining_accounts.to_vec();
 
     let vault = &ctx.accounts.vault;
@@ -114,18 +97,17 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
         VaultError::InvalidAmount
     );
 
-    // Build signer seeds for vault PDA
-    let vault_seeds: &[&[&[u8]]] = &[&[
-        seeds::VAULT,
-        &[vault.bump],
-    ]];
+    let pool_id = vault.pool_id;
+    let vault_seeds: &[&[&[u8]]] = &[&[seeds::VAULT, pool_id.as_ref(), &[vault.bump]]];
 
-    // Record balances before
-    let sol_before = ctx.accounts.sol_treasury.amount;
-    let usdc_before = ctx.accounts.usdc_treasury.amount;
+    // ── CPI 1: collect accumulated fees FIRST (liquidity = 0) ─────────────
+    // decrease_liquidity_v2 with liquidity=0 transfers only accumulated fees.
+    // We collect them separately so we can apply the 10% protocol fee split
+    // before mixing with principal removal.
+    let token0_before_fees = ctx.accounts.token0_treasury.amount;
+    let token1_before_fees = ctx.accounts.token1_treasury.amount;
 
-    // Build CPI context
-    let cpi_accounts = cpi::accounts::DecreaseLiquidityV2 {
+    let fee_cpi_accounts = cpi::accounts::DecreaseLiquidityV2 {
         nft_owner: ctx.accounts.vault.to_account_info(),
         nft_account: ctx.accounts.position_nft_account.to_account_info(),
         personal_position: ctx.accounts.personal_position.to_account_info(),
@@ -135,8 +117,8 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
         token_vault_1: ctx.accounts.token_vault_1.to_account_info(),
         tick_array_lower: ctx.accounts.tick_array_lower.to_account_info(),
         tick_array_upper: ctx.accounts.tick_array_upper.to_account_info(),
-        recipient_token_account_0: ctx.accounts.sol_treasury.to_account_info(),
-        recipient_token_account_1: ctx.accounts.usdc_treasury.to_account_info(),
+        recipient_token_account_0: ctx.accounts.token0_treasury.to_account_info(),
+        recipient_token_account_1: ctx.accounts.token1_treasury.to_account_info(),
         token_program: ctx.accounts.token_program.to_account_info(),
         token_program_2022: ctx.accounts.token_program_2022.to_account_info(),
         memo_program: ctx.accounts.memo_program.to_account_info(),
@@ -144,35 +126,87 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
         vault_1_mint: ctx.accounts.vault_1_mint.to_account_info(),
     };
 
-    let cpi_ctx = CpiContext::new_with_signer(
-        ctx.accounts.clmm_program.to_account_info(),
-        cpi_accounts,
-        vault_seeds,
-    )
-    .with_remaining_accounts(remaining);
+    cpi::decrease_liquidity_v2(
+        CpiContext::new_with_signer(
+            ctx.accounts.clmm_program.to_account_info(),
+            fee_cpi_accounts,
+            vault_seeds,
+        )
+        .with_remaining_accounts(remaining.clone()),
+        0,
+        0,
+        0,
+    )?;
 
-    // Execute CPI to decrease liquidity
-    cpi::decrease_liquidity_v2(cpi_ctx, liquidity, amount_0_min, amount_1_min)?;
+    ctx.accounts.token0_treasury.reload()?;
+    ctx.accounts.token1_treasury.reload()?;
 
-    // Reload treasuries
-    ctx.accounts.sol_treasury.reload()?;
-    ctx.accounts.usdc_treasury.reload()?;
+    // Apply 10% protocol fee split on collected fees
+    let total_fees_token0 = ctx.accounts.token0_treasury.amount.saturating_sub(token0_before_fees);
+    let total_fees_token1 = ctx.accounts.token1_treasury.amount.saturating_sub(token1_before_fees);
+    let protocol_fee_token0 = total_fees_token0 / 10;
+    let protocol_fee_token1 = total_fees_token1 / 10;
 
-    // Calculate amounts received
-    let sol_received = ctx.accounts.sol_treasury.amount.saturating_sub(sol_before);
-    let usdc_received = ctx.accounts.usdc_treasury.amount.saturating_sub(usdc_before);
+    // ── CPI 2: remove actual liquidity ────────────────────────────────────
+    let token0_before_liq = ctx.accounts.token0_treasury.amount;
+    let token1_before_liq = ctx.accounts.token1_treasury.amount;
 
-    // Update vault state
+    let liq_cpi_accounts = cpi::accounts::DecreaseLiquidityV2 {
+        nft_owner: ctx.accounts.vault.to_account_info(),
+        nft_account: ctx.accounts.position_nft_account.to_account_info(),
+        personal_position: ctx.accounts.personal_position.to_account_info(),
+        pool_state: ctx.accounts.pool_state.to_account_info(),
+        protocol_position: ctx.accounts.personal_position.to_account_info(),
+        token_vault_0: ctx.accounts.token_vault_0.to_account_info(),
+        token_vault_1: ctx.accounts.token_vault_1.to_account_info(),
+        tick_array_lower: ctx.accounts.tick_array_lower.to_account_info(),
+        tick_array_upper: ctx.accounts.tick_array_upper.to_account_info(),
+        recipient_token_account_0: ctx.accounts.token0_treasury.to_account_info(),
+        recipient_token_account_1: ctx.accounts.token1_treasury.to_account_info(),
+        token_program: ctx.accounts.token_program.to_account_info(),
+        token_program_2022: ctx.accounts.token_program_2022.to_account_info(),
+        memo_program: ctx.accounts.memo_program.to_account_info(),
+        vault_0_mint: ctx.accounts.vault_0_mint.to_account_info(),
+        vault_1_mint: ctx.accounts.vault_1_mint.to_account_info(),
+    };
+
+    cpi::decrease_liquidity_v2(
+        CpiContext::new_with_signer(
+            ctx.accounts.clmm_program.to_account_info(),
+            liq_cpi_accounts,
+            vault_seeds,
+        )
+        .with_remaining_accounts(remaining),
+        liquidity,
+        amount_0_min,
+        amount_1_min,
+    )?;
+
+    ctx.accounts.token0_treasury.reload()?;
+    ctx.accounts.token1_treasury.reload()?;
+
+    let token0_removed = ctx.accounts.token0_treasury.amount.saturating_sub(token0_before_liq);
+    let token1_removed = ctx.accounts.token1_treasury.amount.saturating_sub(token1_before_liq);
+
+    // ── Update vault state ────────────────────────────────────────────────
     let vault = &mut ctx.accounts.vault;
     vault.position_liquidity = vault.position_liquidity.saturating_sub(liquidity);
-    vault.position_sol = vault.position_sol.saturating_sub(sol_received);
-    vault.position_usdc = vault.position_usdc.saturating_sub(usdc_received);
-    vault.treasury_sol = ctx.accounts.sol_treasury.amount;
-    vault.treasury_usdc = ctx.accounts.usdc_treasury.amount;
+    vault.position_token0 = vault.position_token0.saturating_sub(token0_removed);
+    vault.position_token1 = vault.position_token1.saturating_sub(token1_removed);
+    vault.treasury_token0 = ctx.accounts.token0_treasury.amount;
+    vault.treasury_token1 = ctx.accounts.token1_treasury.amount;
+
+    // Accumulate protocol fees from the fee collection step
+    vault.accumulated_protocol_fees_token0 = vault.accumulated_protocol_fees_token0
+        .checked_add(protocol_fee_token0)
+        .ok_or(error!(VaultError::MathOverflow))?;
+    vault.accumulated_protocol_fees_token1 = vault.accumulated_protocol_fees_token1
+        .checked_add(protocol_fee_token1)
+        .ok_or(error!(VaultError::MathOverflow))?;
 
     emit!(LiquidityDecreased {
-        sol_received,
-        usdc_received,
+        token0_received: token0_removed,
+        token1_received: token1_removed,
         remaining_liquidity: vault.position_liquidity,
     });
 

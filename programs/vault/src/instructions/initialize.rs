@@ -1,21 +1,34 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{Mint, Token, TokenAccount};
 
+use crate::constants::RAYDIUM_CLMM_PROGRAM_ID;
+use crate::errors::VaultError;
 use crate::events::VaultInitialized;
-use crate::state::{seeds, Vault};
+use crate::state::{read_pool_token_mint_0, seeds, Vault};
+
+/// Byte offset of `token_mint_1` in a Raydium CLMM PoolState account.
+/// token_mint_0 is at 73 (32 bytes), token_mint_1immediately follows at 105.
+const POOL_TOKEN_MINT_1_OFFSET: usize = 105;
+
+fn read_pool_token_mint_1(data: &[u8]) -> Option<Pubkey> {
+    let end = POOL_TOKEN_MINT_1_OFFSET + 32;
+    let bytes: [u8; 32] = data.get(POOL_TOKEN_MINT_1_OFFSET..end)?.try_into().ok()?;
+    Some(Pubkey::from(bytes))
+}
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    /// Admin who will manage the vault
+    /// Payer for account creation (deployer keypair). Does NOT become vault admin.
+    /// vault.admin is set via the explicit `admin` parameter in the handler.
     #[account(mut)]
-    pub admin: Signer<'info>,
+    pub payer: Signer<'info>,
 
-    /// Vault state account (PDA)
+    /// Vault state account (PDA). Seeds include pool key → one vault per pool.
     #[account(
         init,
-        payer = admin,
+        payer = payer,
         space = Vault::LEN,
-        seeds = [seeds::VAULT],
+        seeds = [seeds::VAULT, pool.key().as_ref()],
         bump,
     )]
     pub vault: Box<Account<'info, Vault>>,
@@ -23,7 +36,7 @@ pub struct Initialize<'info> {
     /// Share token mint (PDA)
     #[account(
         init,
-        payer = admin,
+        payer = payer,
         seeds = [seeds::SHARE_MINT, vault.key().as_ref()],
         bump,
         mint::decimals = 6,
@@ -31,33 +44,40 @@ pub struct Initialize<'info> {
     )]
     pub share_mint: Box<Account<'info, Mint>>,
 
-    /// SOL treasury token account (holds wSOL)
+    /// token0 treasury token account (holds token0, e.g. wSOL)
     #[account(
         init,
-        payer = admin,
-        seeds = [seeds::SOL_TREASURY, vault.key().as_ref()],
+        payer = payer,
+        seeds = [seeds::TOKEN0_TREASURY, vault.key().as_ref()],
         bump,
-        token::mint = wsol_mint,
-        token::authority = sol_treasury,
+        token::mint = token0_mint,
+        token::authority = token0_treasury,
     )]
-    pub sol_treasury: Box<Account<'info, TokenAccount>>,
+    pub token0_treasury: Box<Account<'info, TokenAccount>>,
 
-    /// USDC treasury token account
+    /// token1 treasury token account (holds token1, e.g. USDC)
     #[account(
         init,
-        payer = admin,
-        seeds = [seeds::USDC_TREASURY, vault.key().as_ref()],
+        payer = payer,
+        seeds = [seeds::TOKEN1_TREASURY, vault.key().as_ref()],
         bump,
-        token::mint = usdc_mint,
-        token::authority = usdc_treasury,
+        token::mint = token1_mint,
+        token::authority = token1_treasury,
     )]
-    pub usdc_treasury: Box<Account<'info, TokenAccount>>,
+    pub token1_treasury: Box<Account<'info, TokenAccount>>,
 
-    /// Wrapped SOL mint
-    pub wsol_mint: Box<Account<'info, Mint>>,
+    /// Mint of token0 (e.g. wSOL)
+    pub token0_mint: Box<Account<'info, Mint>>,
 
-    /// USDC mint (EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v on mainnet)
-    pub usdc_mint: Box<Account<'info, Mint>>,
+    /// Mint of token1 (e.g. USDC)
+    pub token1_mint: Box<Account<'info, Mint>>,
+
+    /// Raydium CLMM pool — its key becomes vault.pool_id (immutable, part of seeds).
+    /// CHECK: ownership validated against Raydium CLMM program ID.
+    #[account(
+        constraint = pool.owner == &RAYDIUM_CLMM_PROGRAM_ID @ VaultError::InvalidPriceFeed,
+    )]
+    pub pool: AccountInfo<'info>,
 
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
@@ -66,40 +86,88 @@ pub struct Initialize<'info> {
 
 pub fn handler(
     ctx: Context<Initialize>,
+    admin: Pubkey,
     protocol_wallet: Pubkey,
-    sol_price_feed: Pubkey,
 ) -> Result<()> {
+    // ── Validate admin and protocol_wallet ───────────────────────────────────
+    // admin is separate from payer: deployer keypair pays for init but doesn't
+    // become vault admin. Pass the real admin hotkey/multisig here.
+    require!(admin != Pubkey::default(), VaultError::Unauthorized);
+    require!(protocol_wallet != Pubkey::default(), VaultError::Unauthorized);
+
+    // ── Validate token mints against pool ────────────────────────────────────
+    // Read pool's actual token mints from raw bytes and verify that the
+    // supplied token0_mint and token1_mint are exactly the pool's mints
+    // (in either order). Prevents wrong-mint vault initialization.
+    let pool_data = ctx.accounts.pool.try_borrow_data()?;
+    let pool_mint_0 = read_pool_token_mint_0(&pool_data)
+        .ok_or(error!(VaultError::InvalidPriceFeed))?;
+    let pool_mint_1 = read_pool_token_mint_1(&pool_data)
+        .ok_or(error!(VaultError::InvalidPriceFeed))?;
+    drop(pool_data);
+
+    let token0_key = ctx.accounts.token0_mint.key();
+    let token1_key = ctx.accounts.token1_mint.key();
+
+    require!(token0_key != token1_key, VaultError::InvalidMint);
+
+    // The two supplied mints must be exactly the pool's two mints (any order).
+    require!(
+        (token0_key == pool_mint_0 && token1_key == pool_mint_1)
+            || (token0_key == pool_mint_1 && token1_key == pool_mint_0),
+        VaultError::InvalidMint
+    );
+
+    // ── Read decimals directly from Anchor-validated mint accounts ────────────
+    // Prevents supplying wrong decimals that would break all math.
+    let token0_decimals = ctx.accounts.token0_mint.decimals;
+    let token1_decimals = ctx.accounts.token1_mint.decimals;
+
+    // ── Initialize vault ──────────────────────────────────────────────────────
     let vault = &mut ctx.accounts.vault;
 
-    vault.admin = ctx.accounts.admin.key();
+    vault.admin = admin;                                    // ← explicit param, not payer
     vault.share_mint = ctx.accounts.share_mint.key();
-    vault.sol_treasury = ctx.accounts.sol_treasury.key();
-    vault.usdc_treasury = ctx.accounts.usdc_treasury.key();
-    vault.usdc_mint = ctx.accounts.usdc_mint.key();
+    vault.pool_id = ctx.accounts.pool.key();
+    vault.token0_mint = token0_key;
+    vault.token1_mint = token1_key;
+    vault.token0_treasury = ctx.accounts.token0_treasury.key();
+    vault.token1_treasury = ctx.accounts.token1_treasury.key();
     vault.protocol_wallet = protocol_wallet;
-    vault.sol_price_feed = sol_price_feed;
 
     vault.total_shares = 0;
-    vault.treasury_sol = 0;
-    vault.treasury_usdc = 0;
-    vault.accumulated_protocol_fees_sol = 0;
-    vault.accumulated_protocol_fees_usdc = 0;
+    vault.treasury_token0 = 0;
+    vault.treasury_token1 = 0;
+    vault.token0_decimals = token0_decimals;
+    vault.token1_decimals = token1_decimals;
+    vault.accumulated_protocol_fees_token0 = 0;
+    vault.accumulated_protocol_fees_token1 = 0;
 
     vault.bump = ctx.bumps.vault;
-    vault.sol_treasury_bump = ctx.bumps.sol_treasury;
-    vault.usdc_treasury_bump = ctx.bumps.usdc_treasury;
+    vault.token0_treasury_bump = ctx.bumps.token0_treasury;
+    vault.token1_treasury_bump = ctx.bumps.token1_treasury;
     vault.share_mint_bump = ctx.bumps.share_mint;
 
     vault.is_paused = false;
     vault.is_rebalancing = false;
+    vault.pending_admin = Pubkey::default();
+
+    vault.has_active_position = false;
+    vault.position_mint = Pubkey::default();
+    vault.position_token0 = 0;
+    vault.position_token1 = 0;
+    vault.position_liquidity = 0;
+    vault.position_tick_lower = 0;
+    vault.position_tick_upper = 0;
+    vault.rebalance_started_at = 0;
 
     emit!(VaultInitialized {
         admin: vault.admin,
         protocol_wallet: vault.protocol_wallet,
         share_mint: vault.share_mint,
-        sol_treasury: vault.sol_treasury,
-        usdc_treasury: vault.usdc_treasury,
-        sol_price_feed: vault.sol_price_feed,
+        token0_treasury: vault.token0_treasury,
+        token1_treasury: vault.token1_treasury,
+        pool_id: vault.pool_id,
     });
 
     Ok(())

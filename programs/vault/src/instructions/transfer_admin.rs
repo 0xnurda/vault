@@ -14,7 +14,7 @@ pub struct TransferAdmin<'info> {
     /// Vault state
     #[account(
         mut,
-        seeds = [seeds::VAULT],
+        seeds = [seeds::VAULT, vault.pool_id.as_ref()],
         bump = vault.bump,
         constraint = vault.admin == admin.key() @ VaultError::Unauthorized,
     )]

@@ -4,37 +4,34 @@ use anchor_spl::token::{Mint, TokenAccount};
 use crate::errors::VaultError;
 use crate::state::{seeds, Vault};
 
-/// One-time migration instruction to upgrade the vault account from the old
-/// layout (389 bytes) to the new layout (447 bytes) after a program upgrade.
+/// One-time migration instruction to upgrade the vault account to the generic
+/// multi-pool layout after a program upgrade.
 ///
 /// Strategy (bypasses broken deserialization):
 ///   1. Verify admin from raw bytes [8..40] — the first field in both layouts.
 ///   2. Fund rent if the realloc needs more lamports.
 ///   3. Realloc vault account to Vault::LEN.
 ///   4. Write a fresh, correctly-typed Vault struct sourced from:
-///       - share_mint.supply  → total_shares
-///       - sol_treasury.amount → treasury_sol
-///       - usdc_treasury.amount → treasury_usdc
-///       - protocol_wallet / sol_price_feed  → supplied by admin as params
+///       - share_mint.supply      → total_shares
+///       - token0_treasury.amount → treasury_token0
+///       - token1_treasury.amount → treasury_token1
+///       - token0/token1 mint keys from treasury accounts
+///       - protocol_wallet / pool_id supplied by admin as params
 ///
-/// All position/rebalancing state is reset to zero/false — the vault had no
-/// active position when this migration is needed.
-///
-/// The instruction is idempotent: re-running it overwrites state with the
-/// same values derived from actual on-chain accounts.
+/// All position/rebalancing state is reset to zero/false.
+/// The instruction is idempotent.
 #[derive(Accounts)]
 pub struct MigrateVault<'info> {
-    /// Admin who authorizes the migration
     #[account(mut)]
     pub admin: Signer<'info>,
 
     /// CHECK: We intentionally skip Anchor deserialization because the old
-    /// layout is incompatible with the new Vault struct.  The PDA address is
-    /// verified via seeds + canonical bump.  The admin authority is verified
+    /// layout is incompatible with the new Vault struct. The PDA address is
+    /// verified via seeds + canonical bump. The admin authority is verified
     /// from raw bytes inside the handler.
     #[account(
         mut,
-        seeds = [seeds::VAULT],
+        seeds = [seeds::VAULT, pool_id_account.key().as_ref()],
         bump,
     )]
     pub vault: AccountInfo<'info>,
@@ -46,19 +43,23 @@ pub struct MigrateVault<'info> {
     )]
     pub share_mint: Account<'info, Mint>,
 
-    /// SOL (wSOL) treasury PDA — amount read for treasury_sol
+    /// Token0 treasury PDA — amount read for treasury_token0
     #[account(
-        seeds = [seeds::SOL_TREASURY, vault.key().as_ref()],
+        seeds = [seeds::TOKEN0_TREASURY, vault.key().as_ref()],
         bump,
     )]
-    pub sol_treasury: Account<'info, TokenAccount>,
+    pub token0_treasury: Account<'info, TokenAccount>,
 
-    /// USDC treasury PDA — amount read for treasury_usdc; mint key stored in vault
+    /// Token1 treasury PDA — amount read for treasury_token1
     #[account(
-        seeds = [seeds::USDC_TREASURY, vault.key().as_ref()],
+        seeds = [seeds::TOKEN1_TREASURY, vault.key().as_ref()],
         bump,
     )]
-    pub usdc_treasury: Account<'info, TokenAccount>,
+    pub token1_treasury: Account<'info, TokenAccount>,
+
+    /// The Raydium CLMM pool — its key is vault.pool_id and part of PDA seeds.
+    /// CHECK: Key used for PDA derivation; ownership checked by Raydium constraint in initialize.
+    pub pool_id_account: AccountInfo<'info>,
 
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
@@ -67,11 +68,10 @@ pub struct MigrateVault<'info> {
 pub fn handler(
     ctx: Context<MigrateVault>,
     protocol_wallet: Pubkey,
-    sol_price_feed: Pubkey,
+    token0_decimals: u8,
+    token1_decimals: u8,
 ) -> Result<()> {
     // ── Step 1: Verify admin from raw bytes ───────────────────────────────
-    // In both the old and new layouts, `admin` is the first Pubkey field
-    // immediately after the 8-byte discriminator → bytes [8..40].
     let stored_admin = {
         let data = ctx.accounts.vault.try_borrow_data()?;
         require!(data.len() >= 40, VaultError::Unauthorized);
@@ -111,66 +111,66 @@ pub fn handler(
     ctx.accounts.vault.resize(Vault::LEN)?;
 
     // ── Step 5: Build fresh Vault from actual on-chain values ─────────────
+    let pool_id = ctx.accounts.pool_id_account.key();
+    let token0_mint = ctx.accounts.token0_treasury.mint;
+    let token1_mint = ctx.accounts.token1_treasury.mint;
+
     let new_vault = Vault {
         admin: ctx.accounts.admin.key(),
         share_mint: ctx.accounts.share_mint.key(),
-        sol_treasury: ctx.accounts.sol_treasury.key(),
-        usdc_treasury: ctx.accounts.usdc_treasury.key(),
-        // usdc_mint stored inside the treasury token-account metadata
-        usdc_mint: ctx.accounts.usdc_treasury.mint,
+        pool_id,
+        token0_mint,
+        token1_mint,
+        token0_treasury: ctx.accounts.token0_treasury.key(),
+        token1_treasury: ctx.accounts.token1_treasury.key(),
         protocol_wallet,
-        sol_price_feed,
+        token0_decimals,
+        token1_decimals,
         // Derive from actual mint supply / token balances
         total_shares: ctx.accounts.share_mint.supply,
-        treasury_sol: ctx.accounts.sol_treasury.amount,
-        treasury_usdc: ctx.accounts.usdc_treasury.amount,
+        treasury_token0: ctx.accounts.token0_treasury.amount,
+        treasury_token1: ctx.accounts.token1_treasury.amount,
         // Canonical PDA bumps as computed by Anchor
         bump: ctx.bumps.vault,
-        sol_treasury_bump: ctx.bumps.sol_treasury,
-        usdc_treasury_bump: ctx.bumps.usdc_treasury,
+        token0_treasury_bump: ctx.bumps.token0_treasury,
+        token1_treasury_bump: ctx.bumps.token1_treasury,
         share_mint_bump: ctx.bumps.share_mint,
         // No active position after migration
         position_mint: Pubkey::default(),
         has_active_position: false,
-        position_sol: 0,
-        position_usdc: 0,
+        position_token0: 0,
+        position_token1: 0,
         position_liquidity: 0,
         position_tick_lower: 0,
         position_tick_upper: 0,
-        position_pool_id: Pubkey::default(),
         // Not paused, not rebalancing
         is_paused: false,
         is_rebalancing: false,
         // No pending admin transfer
         pending_admin: Pubkey::default(),
-        // Fees start at zero (pre-migration fees assumed extracted or none)
-        accumulated_protocol_fees_sol: 0,
-        accumulated_protocol_fees_usdc: 0,
-        // Price not set after migration — admin must call update_price
-        sol_price_usd: 0,
-        last_price_update: 0,
+        // Fees start at zero
+        accumulated_protocol_fees_token0: 0,
+        accumulated_protocol_fees_token1: 0,
+        // No active rebalance
+        rebalance_started_at: 0,
     };
 
     // ── Step 6: Serialize and write back ──────────────────────────────────
-    // Vault::LEN = 8 (disc) + 415 (struct) + 32 (padding zeros) = 455… no,
-    // LEN = 447; struct serialises to 415 bytes; padding 32 bytes remain zero.
     let struct_bytes = new_vault
         .try_to_vec()
         .map_err(|_| error!(VaultError::MathOverflow))?;
 
     let mut data = ctx.accounts.vault.try_borrow_mut_data()?;
-    // Restore discriminator (realloc with zero_init zeroed it)
     data[0..8].copy_from_slice(&discriminator);
-    // Write struct body immediately after discriminator
     data[8..8 + struct_bytes.len()].copy_from_slice(&struct_bytes);
-    // Bytes [8 + struct_bytes.len()..Vault::LEN] remain zero (padding)
 
     msg!(
-        "✅ Vault migrated: admin={}, shares={}, sol={}, usdc={}",
+        "✅ Vault migrated: admin={}, pool_id={}, shares={}, token0={}, token1={}",
         ctx.accounts.admin.key(),
+        pool_id,
         ctx.accounts.share_mint.supply,
-        ctx.accounts.sol_treasury.amount,
-        ctx.accounts.usdc_treasury.amount,
+        ctx.accounts.token0_treasury.amount,
+        ctx.accounts.token1_treasury.amount,
     );
 
     Ok(())

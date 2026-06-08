@@ -21,7 +21,7 @@ pub struct CancelRebalance<'info> {
 
     #[account(
         mut,
-        seeds = [seeds::VAULT],
+        seeds = [seeds::VAULT, vault.pool_id.as_ref()],
         bump = vault.bump,
         constraint = vault.admin == admin.key() @ VaultError::Unauthorized,
         constraint = vault.is_rebalancing @ VaultError::NotRebalancing,
@@ -32,6 +32,7 @@ pub struct CancelRebalance<'info> {
 pub fn handler(ctx: Context<CancelRebalance>) -> Result<()> {
     let vault = &mut ctx.accounts.vault;
     vault.is_rebalancing = false;
+    vault.rebalance_started_at = 0;
 
     msg!(
         "Rebalance cancelled by admin {}. is_rebalancing = false.",

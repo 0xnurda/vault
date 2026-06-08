@@ -22,7 +22,7 @@ pub struct CollectFees<'info> {
 
     #[account(
         mut,
-        seeds = [seeds::VAULT],
+        seeds = [seeds::VAULT, vault.pool_id.as_ref()],
         bump = vault.bump,
         constraint = vault.admin == admin.key() @ VaultError::Unauthorized,
         constraint = vault.has_active_position @ VaultError::NoActivePosition,
@@ -31,17 +31,17 @@ pub struct CollectFees<'info> {
 
     #[account(
         mut,
-        seeds = [seeds::SOL_TREASURY, vault.key().as_ref()],
-        bump = vault.sol_treasury_bump,
+        seeds = [seeds::TOKEN0_TREASURY, vault.key().as_ref()],
+        bump = vault.token0_treasury_bump,
     )]
-    pub sol_treasury: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token0_treasury: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(
         mut,
-        seeds = [seeds::USDC_TREASURY, vault.key().as_ref()],
-        bump = vault.usdc_treasury_bump,
+        seeds = [seeds::TOKEN1_TREASURY, vault.key().as_ref()],
+        bump = vault.token1_treasury_bump,
     )]
-    pub usdc_treasury: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token1_treasury: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(mut)]
     pub pool_state: AccountLoader<'info, PoolState>,
@@ -82,15 +82,20 @@ pub struct CollectFees<'info> {
     pub memo_program: Program<'info, Memo>,
 }
 
-pub fn handler(ctx: Context<CollectFees>) -> Result<()> {
+pub fn handler<'a, 'b, 'c: 'info, 'info>(ctx: Context<'a, 'b, 'c, 'info, CollectFees<'info>>) -> Result<()> {
+    // Must capture remaining_accounts first — Raydium requires [userRewardAta, rewardVault]
+    // pairs for each initialized reward on the pool. Without them the CPI returns
+    // InvalidRewardInputAccountNumber on reward-enabled pools.
+    let remaining = ctx.remaining_accounts.to_vec();
+
     let vault = &ctx.accounts.vault;
+    let pool_id = vault.pool_id;
 
-    let vault_seeds: &[&[&[u8]]] = &[&[seeds::VAULT, &[vault.bump]]];
+    let vault_seeds: &[&[&[u8]]] = &[&[seeds::VAULT, pool_id.as_ref(), &[vault.bump]]];
 
-    let sol_before = ctx.accounts.sol_treasury.amount;
-    let usdc_before = ctx.accounts.usdc_treasury.amount;
+    let token0_before = ctx.accounts.token0_treasury.amount;
+    let token1_before = ctx.accounts.token1_treasury.amount;
 
-    // Calling decrease_liquidity_v2 with 0 liquidity collects accumulated fees
     let cpi_accounts = cpi::accounts::DecreaseLiquidityV2 {
         nft_owner: ctx.accounts.vault.to_account_info(),
         nft_account: ctx.accounts.position_nft_account.to_account_info(),
@@ -101,8 +106,8 @@ pub fn handler(ctx: Context<CollectFees>) -> Result<()> {
         token_vault_1: ctx.accounts.token_vault_1.to_account_info(),
         tick_array_lower: ctx.accounts.tick_array_lower.to_account_info(),
         tick_array_upper: ctx.accounts.tick_array_upper.to_account_info(),
-        recipient_token_account_0: ctx.accounts.sol_treasury.to_account_info(),
-        recipient_token_account_1: ctx.accounts.usdc_treasury.to_account_info(),
+        recipient_token_account_0: ctx.accounts.token0_treasury.to_account_info(),
+        recipient_token_account_1: ctx.accounts.token1_treasury.to_account_info(),
         token_program: ctx.accounts.token_program.to_account_info(),
         token_program_2022: ctx.accounts.token_program_2022.to_account_info(),
         memo_program: ctx.accounts.memo_program.to_account_info(),
@@ -115,43 +120,39 @@ pub fn handler(ctx: Context<CollectFees>) -> Result<()> {
             ctx.accounts.clmm_program.to_account_info(),
             cpi_accounts,
             vault_seeds,
-        ),
+        )
+        .with_remaining_accounts(remaining),
         0,
         0,
         0,
     )?;
 
-    ctx.accounts.sol_treasury.reload()?;
-    ctx.accounts.usdc_treasury.reload()?;
+    ctx.accounts.token0_treasury.reload()?;
+    ctx.accounts.token1_treasury.reload()?;
 
-    let total_sol_fees = ctx.accounts.sol_treasury.amount.saturating_sub(sol_before);
-    let total_usdc_fees = ctx.accounts.usdc_treasury.amount.saturating_sub(usdc_before);
+    let total_token0_fees = ctx.accounts.token0_treasury.amount.saturating_sub(token0_before);
+    let total_token1_fees = ctx.accounts.token1_treasury.amount.saturating_sub(token1_before);
 
-    // 10% to protocol, rounded down (protocol gets slightly less in edge cases)
-    let protocol_sol = total_sol_fees / 10;
-    let protocol_usdc = total_usdc_fees / 10;
+    let protocol_token0 = total_token0_fees / 10;
+    let protocol_token1 = total_token1_fees / 10;
 
     let vault = &mut ctx.accounts.vault;
 
-    // Accumulate protocol fees (excluded from TVL — see state.rs::calculate_tvl)
-    vault.accumulated_protocol_fees_sol = vault.accumulated_protocol_fees_sol
-        .checked_add(protocol_sol)
+    vault.accumulated_protocol_fees_token0 = vault.accumulated_protocol_fees_token0
+        .checked_add(protocol_token0)
         .ok_or(error!(VaultError::MathOverflow))?;
-    vault.accumulated_protocol_fees_usdc = vault.accumulated_protocol_fees_usdc
-        .checked_add(protocol_usdc)
+    vault.accumulated_protocol_fees_token1 = vault.accumulated_protocol_fees_token1
+        .checked_add(protocol_token1)
         .ok_or(error!(VaultError::MathOverflow))?;
 
-    // Update treasury balances (includes both user 90% and protocol 10%)
-    vault.treasury_sol = ctx.accounts.sol_treasury.amount;
-    vault.treasury_usdc = ctx.accounts.usdc_treasury.amount;
-
-    // 90% stays in treasury → TVL increases → share price increases for all users
+    vault.treasury_token0 = ctx.accounts.token0_treasury.amount;
+    vault.treasury_token1 = ctx.accounts.token1_treasury.amount;
 
     emit!(FeesCollected {
-        total_sol_fees,
-        total_usdc_fees,
-        protocol_sol_fees: protocol_sol,
-        protocol_usdc_fees: protocol_usdc,
+        total_token0_fees,
+        total_token1_fees,
+        protocol_token0_fees: protocol_token0,
+        protocol_token1_fees: protocol_token1,
     });
 
     Ok(())

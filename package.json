@@ -8,8 +8,9 @@
     "setup:pool": "ts-node scripts/02-create-pool.ts",
     "setup:vault": "ts-node scripts/03-initialize-vault.ts",
     "test:deposit": "ts-node scripts/04-test-deposit.ts",
-    "test:position": "ts-node scripts/05-test-position.ts",
-    "test:full": "ts-node scripts/06-full-test.ts"
+    "test:position": "ts-node scripts/open-position.ts",
+    "test:full": "ts-node scripts/06-full-test.ts",
+    "test:smart-wallet": "ts-node scripts/test-smart-wallet.ts"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.31.1",

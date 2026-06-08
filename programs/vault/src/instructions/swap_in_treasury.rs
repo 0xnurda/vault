@@ -15,82 +15,62 @@ use crate::state::{seeds, Vault};
 /// Swap direction enum
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
 pub enum SwapDirection {
-    /// Swap SOL → USDC
-    SolToUsdc,
-    /// Swap USDC → SOL
-    UsdcToSol,
+    /// Swap token0 → token1
+    Token0ToToken1,
+    /// Swap token1 → token0
+    Token1ToToken0,
 }
 
 #[derive(Accounts)]
 pub struct SwapInTreasury<'info> {
-    /// Admin performing the swap
     #[account(mut)]
     pub admin: Signer<'info>,
 
-    /// Vault state
     #[account(
         mut,
-        seeds = [seeds::VAULT],
+        seeds = [seeds::VAULT, vault.pool_id.as_ref()],
         bump = vault.bump,
         constraint = vault.admin == admin.key() @ VaultError::Unauthorized,
     )]
     pub vault: Box<Account<'info, Vault>>,
 
-    /// SOL treasury PDA (wSOL)
     #[account(
         mut,
-        seeds = [seeds::SOL_TREASURY, vault.key().as_ref()],
-        bump = vault.sol_treasury_bump,
+        seeds = [seeds::TOKEN0_TREASURY, vault.key().as_ref()],
+        bump = vault.token0_treasury_bump,
     )]
-    pub sol_treasury: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token0_treasury: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    /// USDC treasury PDA
     #[account(
         mut,
-        seeds = [seeds::USDC_TREASURY, vault.key().as_ref()],
-        bump = vault.usdc_treasury_bump,
+        seeds = [seeds::TOKEN1_TREASURY, vault.key().as_ref()],
+        bump = vault.token1_treasury_bump,
     )]
-    pub usdc_treasury: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token1_treasury: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    // ============ Raydium CLMM accounts ============
-
-    /// AMM config account
     pub amm_config: Box<Account<'info, AmmConfig>>,
 
-    /// Pool state account
     #[account(mut)]
     pub pool_state: AccountLoader<'info, PoolState>,
 
-    /// Input vault (Raydium pool vault for input token)
     #[account(mut)]
     pub input_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    /// Output vault (Raydium pool vault for output token)
     #[account(mut)]
     pub output_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    /// Observation state for price oracle
     #[account(mut)]
     pub observation_state: AccountLoader<'info, ObservationState>,
 
-    /// Input vault mint
     pub input_vault_mint: Box<InterfaceAccount<'info, Mint>>,
-
-    /// Output vault mint
     pub output_vault_mint: Box<InterfaceAccount<'info, Mint>>,
 
-    /// Raydium CLMM program
     /// CHECK: Validated by address constraint
     #[account(address = raydium_clmm_cpi::id())]
     pub clmm_program: UncheckedAccount<'info>,
 
-    /// Token program
     pub token_program: Program<'info, Token>,
-
-    /// Token 2022 program
     pub token_program_2022: Program<'info, Token2022>,
-
-    /// Memo program
     pub memo_program: Program<'info, Memo>,
 }
 
@@ -101,42 +81,63 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     direction: SwapDirection,
 ) -> Result<()> {
     require!(amount_in > 0, VaultError::InvalidAmount);
-    require!(minimum_amount_out > 0, VaultError::InvalidAmount); // Prevent 0-slippage swaps
+    require!(minimum_amount_out > 0, VaultError::InvalidAmount);
 
     let vault = &ctx.accounts.vault;
 
-    // Determine input/output treasuries based on direction
-    let (input_treasury, output_treasury, is_base_input) = match direction {
-        SwapDirection::SolToUsdc => {
+    // Swapping with an active position would leave vault.position_token0/token1
+    // stale relative to the post-swap treasury, breaking withdrawal entitlements.
+    // Close the position first, then swap, then open a new position.
+    require!(!vault.has_active_position, VaultError::PositionAlreadyExists);
+
+    let (input_treasury, output_treasury) = match direction {
+        SwapDirection::Token0ToToken1 => {
             require!(
-                ctx.accounts.sol_treasury.amount >= amount_in,
+                ctx.accounts.token0_treasury.amount >= amount_in,
                 VaultError::InsufficientTreasuryBalance
             );
-            (&ctx.accounts.sol_treasury, &ctx.accounts.usdc_treasury, true)
+            // Validate that the caller passed Raydium vaults matching our token ordering.
+            // pool.token_vault_N may be vault.token0 or vault.token1 depending on the pool —
+            // this check ensures the script isn't hard-coded for a specific pool layout.
+            require!(
+                ctx.accounts.input_vault.mint == vault.token0_mint,
+                VaultError::InvalidMint
+            );
+            require!(
+                ctx.accounts.output_vault.mint == vault.token1_mint,
+                VaultError::InvalidMint
+            );
+            (&ctx.accounts.token0_treasury, &ctx.accounts.token1_treasury)
         }
-        SwapDirection::UsdcToSol => {
+        SwapDirection::Token1ToToken0 => {
             require!(
-                ctx.accounts.usdc_treasury.amount >= amount_in,
+                ctx.accounts.token1_treasury.amount >= amount_in,
                 VaultError::InsufficientTreasuryBalance
             );
-            (&ctx.accounts.usdc_treasury, &ctx.accounts.sol_treasury, false)
+            require!(
+                ctx.accounts.input_vault.mint == vault.token1_mint,
+                VaultError::InvalidMint
+            );
+            require!(
+                ctx.accounts.output_vault.mint == vault.token0_mint,
+                VaultError::InvalidMint
+            );
+            (&ctx.accounts.token1_treasury, &ctx.accounts.token0_treasury)
         }
     };
 
-    // Build signer seeds for treasury PDA
     let vault_key = vault.key();
-    let (treasury_seeds, treasury_bump): (&[u8], u8) = match direction {
-        SwapDirection::SolToUsdc => (seeds::SOL_TREASURY, vault.sol_treasury_bump),
-        SwapDirection::UsdcToSol => (seeds::USDC_TREASURY, vault.usdc_treasury_bump),
+    let (treasury_seed, treasury_bump): (&[u8], u8) = match direction {
+        SwapDirection::Token0ToToken1 => (seeds::TOKEN0_TREASURY, vault.token0_treasury_bump),
+        SwapDirection::Token1ToToken0 => (seeds::TOKEN1_TREASURY, vault.token1_treasury_bump),
     };
 
     let signer_seeds: &[&[&[u8]]] = &[&[
-        treasury_seeds,
+        treasury_seed,
         vault_key.as_ref(),
         &[treasury_bump],
     ]];
 
-    // Build CPI context for Raydium swap
     let cpi_accounts = cpi::accounts::SwapSingleV2 {
         payer: input_treasury.to_account_info(),
         amm_config: ctx.accounts.amm_config.to_account_info(),
@@ -157,35 +158,27 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
         ctx.accounts.clmm_program.to_account_info(),
         cpi_accounts,
         signer_seeds,
-    );
+    )
+    .with_remaining_accounts(ctx.remaining_accounts.to_vec());
 
-    // Add remaining accounts (tick arrays)
-    let cpi_ctx = cpi_ctx.with_remaining_accounts(ctx.remaining_accounts.to_vec());
+    cpi::swap_v2(cpi_ctx, amount_in, minimum_amount_out, 0, true)?;
 
-    // Execute swap via CPI
-    // sqrt_price_limit_x64 = 0 means no price limit
-    cpi::swap_v2(
-        cpi_ctx,
-        amount_in,
-        minimum_amount_out,
-        0, // sqrt_price_limit_x64 - no limit
-        is_base_input,
-    )?;
+    ctx.accounts.token0_treasury.reload()?;
+    ctx.accounts.token1_treasury.reload()?;
 
-    // Reload accounts to get updated balances
-    ctx.accounts.sol_treasury.reload()?;
-    ctx.accounts.usdc_treasury.reload()?;
-
-    // Update vault state with new treasury balances
     let vault = &mut ctx.accounts.vault.as_mut();
-    vault.treasury_sol = ctx.accounts.sol_treasury.amount;
-    vault.treasury_usdc = ctx.accounts.usdc_treasury.amount;
+    vault.treasury_token0 = ctx.accounts.token0_treasury.amount;
+    vault.treasury_token1 = ctx.accounts.token1_treasury.amount;
 
     emit!(SwapEvent {
         amount_in,
-        direction: if direction == SwapDirection::SolToUsdc { "SOL->USDC".to_string() } else { "USDC->SOL".to_string() },
-        treasury_sol: vault.treasury_sol,
-        treasury_usdc: vault.treasury_usdc,
+        direction: if direction == SwapDirection::Token0ToToken1 {
+            "TOKEN0->TOKEN1".to_string()
+        } else {
+            "TOKEN1->TOKEN0".to_string()
+        },
+        treasury_token0: vault.treasury_token0,
+        treasury_token1: vault.treasury_token1,
     });
 
     Ok(())

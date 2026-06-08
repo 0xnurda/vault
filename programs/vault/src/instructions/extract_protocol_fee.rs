@@ -6,8 +6,6 @@ use crate::events::ProtocolFeeExtracted;
 use crate::state::{seeds, Vault};
 
 /// Extract accumulated protocol fees (10% of collected fees) to protocol_wallet.
-/// Can be called at any time by admin — once a week, once a month, etc.
-/// TVL is not affected: accumulated_protocol_fees were already excluded from TVL in calculate_tvl().
 #[derive(Accounts)]
 pub struct ExtractProtocolFee<'info> {
     #[account(mut)]
@@ -15,45 +13,41 @@ pub struct ExtractProtocolFee<'info> {
 
     #[account(
         mut,
-        seeds = [seeds::VAULT],
+        seeds = [seeds::VAULT, vault.pool_id.as_ref()],
         bump = vault.bump,
         constraint = vault.admin == admin.key() @ VaultError::Unauthorized,
     )]
     pub vault: Box<Account<'info, Vault>>,
 
-    /// SOL treasury (source for SOL fees)
     #[account(
         mut,
-        seeds = [seeds::SOL_TREASURY, vault.key().as_ref()],
-        bump = vault.sol_treasury_bump,
+        seeds = [seeds::TOKEN0_TREASURY, vault.key().as_ref()],
+        bump = vault.token0_treasury_bump,
     )]
-    pub sol_treasury: Box<Account<'info, TokenAccount>>,
+    pub token0_treasury: Box<Account<'info, TokenAccount>>,
 
-    /// USDC treasury (source for USDC fees)
     #[account(
         mut,
-        seeds = [seeds::USDC_TREASURY, vault.key().as_ref()],
-        bump = vault.usdc_treasury_bump,
+        seeds = [seeds::TOKEN1_TREASURY, vault.key().as_ref()],
+        bump = vault.token1_treasury_bump,
     )]
-    pub usdc_treasury: Box<Account<'info, TokenAccount>>,
+    pub token1_treasury: Box<Account<'info, TokenAccount>>,
 
-    /// Protocol wallet SOL (wSOL) token account — destination for SOL fees.
-    /// Must be owned by vault.protocol_wallet.
+    /// Protocol wallet token0 account — destination for token0 fees.
     #[account(
         mut,
-        constraint = protocol_sol_account.owner == vault.protocol_wallet @ VaultError::Unauthorized,
-        constraint = protocol_sol_account.mint == sol_treasury.mint @ VaultError::InvalidMint,
+        constraint = protocol_token0_account.owner == vault.protocol_wallet @ VaultError::Unauthorized,
+        constraint = protocol_token0_account.mint == token0_treasury.mint @ VaultError::InvalidMint,
     )]
-    pub protocol_sol_account: Box<Account<'info, TokenAccount>>,
+    pub protocol_token0_account: Box<Account<'info, TokenAccount>>,
 
-    /// Protocol wallet USDC token account — destination for USDC fees.
-    /// Must be owned by vault.protocol_wallet.
+    /// Protocol wallet token1 account — destination for token1 fees.
     #[account(
         mut,
-        constraint = protocol_usdc_account.owner == vault.protocol_wallet @ VaultError::Unauthorized,
-        constraint = protocol_usdc_account.mint == usdc_treasury.mint @ VaultError::InvalidMint,
+        constraint = protocol_token1_account.owner == vault.protocol_wallet @ VaultError::Unauthorized,
+        constraint = protocol_token1_account.mint == token1_treasury.mint @ VaultError::InvalidMint,
     )]
-    pub protocol_usdc_account: Box<Account<'info, TokenAccount>>,
+    pub protocol_token1_account: Box<Account<'info, TokenAccount>>,
 
     pub token_program: Program<'info, Token>,
 }
@@ -62,59 +56,61 @@ pub fn handler(ctx: Context<ExtractProtocolFee>) -> Result<()> {
     let vault = &ctx.accounts.vault;
 
     require!(
-        vault.accumulated_protocol_fees_sol > 0 || vault.accumulated_protocol_fees_usdc > 0,
+        vault.accumulated_protocol_fees_token0 > 0 || vault.accumulated_protocol_fees_token1 > 0,
         VaultError::NoFeesToExtract
     );
 
-    let sol_to_extract = vault.accumulated_protocol_fees_sol;
-    let usdc_to_extract = vault.accumulated_protocol_fees_usdc;
+    let token0_to_extract = vault.accumulated_protocol_fees_token0;
+    let token1_to_extract = vault.accumulated_protocol_fees_token1;
 
-    // Transfer SOL fees to protocol wallet
-    if sol_to_extract > 0 {
+    if token0_to_extract > 0 {
         let vault_key = vault.key();
-        let seeds = &[seeds::SOL_TREASURY, vault_key.as_ref(), &[vault.sol_treasury_bump]];
+        let seeds = &[seeds::TOKEN0_TREASURY, vault_key.as_ref(), &[vault.token0_treasury_bump]];
         token::transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
                 Transfer {
-                    from: ctx.accounts.sol_treasury.to_account_info(),
-                    to: ctx.accounts.protocol_sol_account.to_account_info(),
-                    authority: ctx.accounts.sol_treasury.to_account_info(),
+                    from: ctx.accounts.token0_treasury.to_account_info(),
+                    to: ctx.accounts.protocol_token0_account.to_account_info(),
+                    authority: ctx.accounts.token0_treasury.to_account_info(),
                 },
                 &[&seeds[..]],
             ),
-            sol_to_extract,
+            token0_to_extract,
         )?;
     }
 
-    // Transfer USDC fees to protocol wallet
-    if usdc_to_extract > 0 {
+    if token1_to_extract > 0 {
         let vault_key = vault.key();
-        let seeds = &[seeds::USDC_TREASURY, vault_key.as_ref(), &[vault.usdc_treasury_bump]];
+        let seeds = &[seeds::TOKEN1_TREASURY, vault_key.as_ref(), &[vault.token1_treasury_bump]];
         token::transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
                 Transfer {
-                    from: ctx.accounts.usdc_treasury.to_account_info(),
-                    to: ctx.accounts.protocol_usdc_account.to_account_info(),
-                    authority: ctx.accounts.usdc_treasury.to_account_info(),
+                    from: ctx.accounts.token1_treasury.to_account_info(),
+                    to: ctx.accounts.protocol_token1_account.to_account_info(),
+                    authority: ctx.accounts.token1_treasury.to_account_info(),
                 },
                 &[&seeds[..]],
             ),
-            usdc_to_extract,
+            token1_to_extract,
         )?;
     }
 
-    // Update vault state
+    // Reload actual balances before updating the cache — ensures
+    // vault.treasury_token0/token1 is always ground-truth after extraction.
+    ctx.accounts.token0_treasury.reload()?;
+    ctx.accounts.token1_treasury.reload()?;
+
     let vault = &mut ctx.accounts.vault;
-    vault.treasury_sol = vault.treasury_sol.saturating_sub(sol_to_extract);
-    vault.treasury_usdc = vault.treasury_usdc.saturating_sub(usdc_to_extract);
-    vault.accumulated_protocol_fees_sol = 0;
-    vault.accumulated_protocol_fees_usdc = 0;
+    vault.treasury_token0 = ctx.accounts.token0_treasury.amount;
+    vault.treasury_token1 = ctx.accounts.token1_treasury.amount;
+    vault.accumulated_protocol_fees_token0 = 0;
+    vault.accumulated_protocol_fees_token1 = 0;
 
     emit!(ProtocolFeeExtracted {
-        sol_amount: sol_to_extract,
-        usdc_amount: usdc_to_extract,
+        token0_amount: token0_to_extract,
+        token1_amount: token1_to_extract,
         protocol_wallet: vault.protocol_wallet,
     });
 

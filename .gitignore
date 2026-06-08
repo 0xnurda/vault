@@ -10,8 +10,8 @@ test-ledger
 # Build artifacts
 /target/
 **/.anchor/
-
-# IDL
+scripts
+# IDL (keep these for frontend integration)
 # Uncomment if you want to ignore generated IDL files
 # target/idl/
 # target/types/
@@ -48,3 +48,13 @@ yarn-error.log
 # Logs
 *.log
 logs/
+
+# Configs with real on-chain addresses
+devnet-config.json
+mainnet-config.json
+
+# Keypair files in root
+*-keypair.json
+
+# TypeScript
+*.tsbuildinfo

@@ -1,0 +1,31 @@
+{
+  "network": "devnet",
+  "rpc": "https://api.devnet.solana.com",
+  "wallet": "YOUR_WALLET_ADDRESS",
+  "tokens": {
+    "tsol": {
+      "mint": "TSOL_MINT_ADDRESS",
+      "decimals": 9,
+      "account": "YOUR_TSOL_TOKEN_ACCOUNT"
+    },
+    "tusdc": {
+      "mint": "TUSDC_MINT_ADDRESS",
+      "decimals": 6,
+      "account": "YOUR_TUSDC_TOKEN_ACCOUNT"
+    }
+  },
+  "pool": {
+    "poolId": "RAYDIUM_POOL_ID",
+    "ammConfig": "RAYDIUM_AMM_CONFIG",
+    "createdBy": "manual",
+    "note": "Create pool using Raydium UI or SDK"
+  },
+  "vault": {
+    "programId": "VAULT_PROGRAM_ID",
+    "vaultPda": "VAULT_PDA_ADDRESS",
+    "shareMint": "SHARE_MINT_ADDRESS",
+    "solTreasury": "SOL_TREASURY_ADDRESS",
+    "usdcTreasury": "USDC_TREASURY_ADDRESS",
+    "admin": "ADMIN_WALLET_ADDRESS"
+  }
+}
