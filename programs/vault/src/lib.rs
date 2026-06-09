@@ -43,6 +43,11 @@ pub mod vault {
         instructions::accept_admin::handler(ctx)
     }
 
+    /// Set the hot operator key for automated ops (admin only).
+    pub fn set_operator(ctx: Context<SetOperator>, new_operator: Pubkey) -> Result<()> {
+        instructions::set_operator::handler(ctx, new_operator)
+    }
+
     /// Extract accumulated protocol fees (10% of collected fees) to protocol_wallet
     pub fn extract_protocol_fee(ctx: Context<ExtractProtocolFee>) -> Result<()> {
         instructions::extract_protocol_fee::handler(ctx)
@@ -54,13 +59,12 @@ pub mod vault {
     }
 
     /// One-time migration: upgrades vault account layout after program upgrade.
+    /// Decimals are now read from mint accounts — no longer accepted as args (audit #3).
     pub fn migrate_vault(
         ctx: Context<MigrateVault>,
         protocol_wallet: Pubkey,
-        token0_decimals: u8,
-        token1_decimals: u8,
     ) -> Result<()> {
-        instructions::migrate_vault::handler(ctx, protocol_wallet, token0_decimals, token1_decimals)
+        instructions::migrate_vault::handler(ctx, protocol_wallet)
     }
 
     /// Sync vault.position_token0/token1 with real on-chain CLMM amounts.

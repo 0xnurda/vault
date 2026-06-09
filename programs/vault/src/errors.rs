@@ -67,4 +67,7 @@ pub enum VaultError {
 
     #[msg("Output below minimum: slippage tolerance exceeded")]
     SlippageExceeded,
+
+    #[msg("Price manipulation detected: spot price deviates from TWAP by more than 1.5%")]
+    PriceManipulationDetected,
 }

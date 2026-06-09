@@ -24,7 +24,7 @@ pub struct CollectFees<'info> {
         mut,
         seeds = [seeds::VAULT, vault.pool_id.as_ref()],
         bump = vault.bump,
-        constraint = vault.admin == admin.key() @ VaultError::Unauthorized,
+        constraint = vault.is_operator(&admin.key()) @ VaultError::Unauthorized,
         constraint = vault.has_active_position @ VaultError::NoActivePosition,
     )]
     pub vault: Box<Account<'info, Vault>>,

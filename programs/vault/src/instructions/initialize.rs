@@ -1,20 +1,10 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{Mint, Token, TokenAccount};
+use raydium_clmm_cpi::states::PoolState;
 
-use crate::constants::RAYDIUM_CLMM_PROGRAM_ID;
 use crate::errors::VaultError;
 use crate::events::VaultInitialized;
-use crate::state::{read_pool_token_mint_0, seeds, Vault};
-
-/// Byte offset of `token_mint_1` in a Raydium CLMM PoolState account.
-/// token_mint_0 is at 73 (32 bytes), token_mint_1immediately follows at 105.
-const POOL_TOKEN_MINT_1_OFFSET: usize = 105;
-
-fn read_pool_token_mint_1(data: &[u8]) -> Option<Pubkey> {
-    let end = POOL_TOKEN_MINT_1_OFFSET + 32;
-    let bytes: [u8; 32] = data.get(POOL_TOKEN_MINT_1_OFFSET..end)?.try_into().ok()?;
-    Some(Pubkey::from(bytes))
-}
+use crate::state::{seeds, Vault};
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
@@ -72,12 +62,9 @@ pub struct Initialize<'info> {
     /// Mint of token1 (e.g. USDC)
     pub token1_mint: Box<Account<'info, Mint>>,
 
-    /// Raydium CLMM pool — its key becomes vault.pool_id (immutable, part of seeds).
-    /// CHECK: ownership validated against Raydium CLMM program ID.
-    #[account(
-        constraint = pool.owner == &RAYDIUM_CLMM_PROGRAM_ID @ VaultError::InvalidPriceFeed,
-    )]
-    pub pool: AccountInfo<'info>,
+    /// Raydium CLMM pool — typed AccountLoader validates ownership + discriminator (audit #6).
+    /// Its key becomes vault.pool_id (immutable, part of seeds).
+    pub pool: AccountLoader<'info, PoolState>,
 
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
@@ -90,21 +77,16 @@ pub fn handler(
     protocol_wallet: Pubkey,
 ) -> Result<()> {
     // ── Validate admin and protocol_wallet ───────────────────────────────────
-    // admin is separate from payer: deployer keypair pays for init but doesn't
-    // become vault admin. Pass the real admin hotkey/multisig here.
     require!(admin != Pubkey::default(), VaultError::Unauthorized);
     require!(protocol_wallet != Pubkey::default(), VaultError::Unauthorized);
 
-    // ── Validate token mints against pool ────────────────────────────────────
-    // Read pool's actual token mints from raw bytes and verify that the
-    // supplied token0_mint and token1_mint are exactly the pool's mints
-    // (in either order). Prevents wrong-mint vault initialization.
-    let pool_data = ctx.accounts.pool.try_borrow_data()?;
-    let pool_mint_0 = read_pool_token_mint_0(&pool_data)
-        .ok_or(error!(VaultError::InvalidPriceFeed))?;
-    let pool_mint_1 = read_pool_token_mint_1(&pool_data)
-        .ok_or(error!(VaultError::InvalidPriceFeed))?;
-    drop(pool_data);
+    // ── Validate token mints against pool (typed access, audit #6) ───────────
+    // AccountLoader validates ownership (Raydium CLMM) + discriminator automatically.
+    // Read token_mint_0 and token_mint_1 directly from the typed PoolState.
+    let (pool_mint_0, pool_mint_1) = {
+        let pool = ctx.accounts.pool.load()?;
+        (pool.token_mint_0, pool.token_mint_1)
+    };
 
     let token0_key = ctx.accounts.token0_mint.key();
     let token1_key = ctx.accounts.token1_mint.key();
@@ -118,15 +100,15 @@ pub fn handler(
         VaultError::InvalidMint
     );
 
-    // ── Read decimals directly from Anchor-validated mint accounts ────────────
-    // Prevents supplying wrong decimals that would break all math.
+    // ── Read decimals from Anchor-validated mint accounts ─────────────────────
     let token0_decimals = ctx.accounts.token0_mint.decimals;
     let token1_decimals = ctx.accounts.token1_mint.decimals;
 
     // ── Initialize vault ──────────────────────────────────────────────────────
     let vault = &mut ctx.accounts.vault;
 
-    vault.admin = admin;                                    // ← explicit param, not payer
+    vault.admin = admin;
+    vault.operator = admin;   // default operator = admin; change later via set_operator
     vault.share_mint = ctx.accounts.share_mint.key();
     vault.pool_id = ctx.accounts.pool.key();
     vault.token0_mint = token0_key;

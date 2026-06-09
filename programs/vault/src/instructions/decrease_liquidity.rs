@@ -21,7 +21,7 @@ pub struct DecreaseLiquidity<'info> {
         mut,
         seeds = [seeds::VAULT, vault.pool_id.as_ref()],
         bump = vault.bump,
-        constraint = vault.admin == admin.key() @ VaultError::Unauthorized,
+        constraint = vault.is_operator(&admin.key()) @ VaultError::Unauthorized,
         constraint = vault.has_active_position @ VaultError::NoActivePosition,
     )]
     pub vault: Box<Account<'info, Vault>>,
@@ -100,54 +100,10 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     let pool_id = vault.pool_id;
     let vault_seeds: &[&[&[u8]]] = &[&[seeds::VAULT, pool_id.as_ref(), &[vault.bump]]];
 
-    // ── CPI 1: collect accumulated fees FIRST (liquidity = 0) ─────────────
-    // decrease_liquidity_v2 with liquidity=0 transfers only accumulated fees.
-    // We collect them separately so we can apply the 10% protocol fee split
-    // before mixing with principal removal.
-    let token0_before_fees = ctx.accounts.token0_treasury.amount;
-    let token1_before_fees = ctx.accounts.token1_treasury.amount;
-
-    let fee_cpi_accounts = cpi::accounts::DecreaseLiquidityV2 {
-        nft_owner: ctx.accounts.vault.to_account_info(),
-        nft_account: ctx.accounts.position_nft_account.to_account_info(),
-        personal_position: ctx.accounts.personal_position.to_account_info(),
-        pool_state: ctx.accounts.pool_state.to_account_info(),
-        protocol_position: ctx.accounts.personal_position.to_account_info(),
-        token_vault_0: ctx.accounts.token_vault_0.to_account_info(),
-        token_vault_1: ctx.accounts.token_vault_1.to_account_info(),
-        tick_array_lower: ctx.accounts.tick_array_lower.to_account_info(),
-        tick_array_upper: ctx.accounts.tick_array_upper.to_account_info(),
-        recipient_token_account_0: ctx.accounts.token0_treasury.to_account_info(),
-        recipient_token_account_1: ctx.accounts.token1_treasury.to_account_info(),
-        token_program: ctx.accounts.token_program.to_account_info(),
-        token_program_2022: ctx.accounts.token_program_2022.to_account_info(),
-        memo_program: ctx.accounts.memo_program.to_account_info(),
-        vault_0_mint: ctx.accounts.vault_0_mint.to_account_info(),
-        vault_1_mint: ctx.accounts.vault_1_mint.to_account_info(),
-    };
-
-    cpi::decrease_liquidity_v2(
-        CpiContext::new_with_signer(
-            ctx.accounts.clmm_program.to_account_info(),
-            fee_cpi_accounts,
-            vault_seeds,
-        )
-        .with_remaining_accounts(remaining.clone()),
-        0,
-        0,
-        0,
-    )?;
-
-    ctx.accounts.token0_treasury.reload()?;
-    ctx.accounts.token1_treasury.reload()?;
-
-    // Apply 10% protocol fee split on collected fees
-    let total_fees_token0 = ctx.accounts.token0_treasury.amount.saturating_sub(token0_before_fees);
-    let total_fees_token1 = ctx.accounts.token1_treasury.amount.saturating_sub(token1_before_fees);
-    let protocol_fee_token0 = total_fees_token0 / 10;
-    let protocol_fee_token1 = total_fees_token1 / 10;
-
-    // ── CPI 2: remove actual liquidity ────────────────────────────────────
+    // ── Lean partial withdraw (Kamino-style): single CPI, no fee split ────
+    // Trading fees are harvested separately by `collect_fees` (10% taken there).
+    // This removes the requested liquidity in ONE DecreaseLiquidityV2 CPI
+    // (which also auto-collects residual fees into treasury → benefit users).
     let token0_before_liq = ctx.accounts.token0_treasury.amount;
     let token1_before_liq = ctx.accounts.token1_treasury.amount;
 
@@ -196,13 +152,7 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     vault.treasury_token0 = ctx.accounts.token0_treasury.amount;
     vault.treasury_token1 = ctx.accounts.token1_treasury.amount;
 
-    // Accumulate protocol fees from the fee collection step
-    vault.accumulated_protocol_fees_token0 = vault.accumulated_protocol_fees_token0
-        .checked_add(protocol_fee_token0)
-        .ok_or(error!(VaultError::MathOverflow))?;
-    vault.accumulated_protocol_fees_token1 = vault.accumulated_protocol_fees_token1
-        .checked_add(protocol_fee_token1)
-        .ok_or(error!(VaultError::MathOverflow))?;
+    // Note: protocol fee 10% is taken in `collect_fees`, not here (lean op).
 
     emit!(LiquidityDecreased {
         token0_received: token0_removed,

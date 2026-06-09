@@ -14,3 +14,10 @@ pub const MIN_DEPOSIT_TOKEN0: u64 = 1_000; // raw units
 
 /// Minimum token1 deposit (anti-dust)
 pub const MIN_DEPOSIT_TOKEN1: u64 = 1_000; // raw units
+
+/// Phantom "dead shares" added to total_shares on the first deposit (audit #7).
+/// These shares are never redeemable — they prevent first-depositor price manipulation
+/// by ensuring price_per_share = deposit_value / (deposit_value + DEAD_SHARES) ≈ 1
+/// rather than allowing an attacker to set an arbitrary price with a 1-unit deposit.
+/// Negligible cost to first depositor: 1000 / deposit_value (e.g. 0.0015% for 1 SOL deposit).
+pub const DEAD_SHARES: u64 = 1_000;

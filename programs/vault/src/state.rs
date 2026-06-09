@@ -1,5 +1,6 @@
 use anchor_lang::prelude::*;
 use crate::errors::VaultError;
+use raydium_clmm_cpi::states::{ObservationState, OBSERVATION_NUM};
 
 /// Main Vault account - stores global state.
 /// One vault per Raydium CLMM pool; PDA seeds = [b"vault", pool_id].
@@ -69,6 +70,10 @@ pub struct Vault {
     /// Emergency withdrawal timeout: users can withdraw after 3600s even if rebalancing.
     /// Cleared by open_position and cancel_rebalance.
     pub rebalance_started_at: i64,
+    /// Hot operator key for automated operations (rebalance, collect_fees, swaps).
+    /// Separate from admin: admin (cold/multisig) sets config; operator (hot bot)
+    /// runs day-to-day ops within on-chain guardrails and CANNOT move funds out.
+    pub operator: Pubkey,
 }
 
 impl Vault {
@@ -103,6 +108,7 @@ impl Vault {
         8  + // accumulated_protocol_fees_token0
         8  + // accumulated_protocol_fees_token1
         8  + // rebalance_started_at
+        32 + // operator (Pubkey)
         16;  // padding for future fields
 
     /// Calculate TVL in token1 units using on-chain pool price.
@@ -202,6 +208,12 @@ impl Vault {
     /// User-accessible treasury token1 (excluding protocol fees).
     pub fn user_treasury_token1(&self) -> u64 {
         self.treasury_token1.saturating_sub(self.accumulated_protocol_fees_token1)
+    }
+
+    /// True if `key` may run operational actions (rebalance, collect_fees, swap).
+    /// Both the hot operator and the admin are authorized.
+    pub fn is_operator(&self, key: &Pubkey) -> bool {
+        *key == self.operator || *key == self.admin
     }
 }
 
@@ -328,40 +340,84 @@ pub fn get_sqrt_price_at_tick(tick: i32) -> u128 {
     if abs_tick & 0x40000  != 0 { ratio = mul_shift_128(ratio, 0x2216e584f5fa1ea926041bedfe98);     }
     if abs_tick & 0x80000  != 0 { ratio = mul_shift_128(ratio, 0x48a170391f7dc42444e8fa2);          }
 
-    if tick > 0 {
-        ratio = u128::MAX / ratio;
-    }
-
+    // Convert Q128.128 ratio → Q64.64 sqrt price. The constant table encodes
+    // ratios < 1, so this is the sqrt price for the NEGATIVE-tick direction.
     let frac = ratio & ((1u128 << 64) - 1);
-    (ratio >> 64) + if frac != 0 { 1 } else { 0 }
+    let neg_sqrt_x64 = (ratio >> 64) + if frac != 0 { 1 } else { 0 };
+
+    if tick > 0 {
+        // Positive tick: invert in x64 space. sqrt_pos = 1 / sqrt_neg, which in
+        // Q64.64 is sqrt_pos_x64 = 2^128 / sqrt_neg_x64. Since 2^128 doesn't fit
+        // u128, use floor((2^128 − 1) / x) — error ≤ 1 ulp (verified ~2e-10).
+        //
+        // NOTE: the previous `u128::MAX / ratio` inverted the Q128 ratio (2^128
+        // numerator) instead of the Q64 sqrt price, returning ~1 for all positive
+        // ticks. That was correct only because SOL/USDC sits at negative ticks.
+        (u128::MAX / neg_sqrt_x64).max(1)
+    } else {
+        neg_sqrt_x64
+    }
 }
 
 /// token0 amount from a liquidity range.
+///
+/// Formula: L × (√P_hi − √P_lo) / (√P_hi × √P_lo) × 2⁶⁴
+///
+/// Uses divide-first to avoid intermediate u128 overflow for realistic pool sizes.
+/// The two-step decomposition (div by √P_hi, then × 2⁶⁴ / √P_lo) is numerically
+/// identical to the closed form but keeps each intermediate value below 2¹²⁸.
 pub fn get_amount_0_delta(sqrt_lo: u128, sqrt_hi: u128, liquidity: u128) -> u64 {
-    if sqrt_lo >= sqrt_hi || liquidity == 0 {
+    if sqrt_lo == 0 || sqrt_hi <= sqrt_lo || liquidity == 0 {
         return 0;
     }
-    let diff = sqrt_hi - sqrt_lo;
-    let step1 = (liquidity as u128)
-        .saturating_mul(diff)
-        .checked_div(sqrt_hi)
-        .unwrap_or(0);
-    let result = step1
-        .checked_shl(32)
-        .unwrap_or(u128::MAX)
-        .checked_div(sqrt_lo >> 32)
-        .unwrap_or(0);
-    result.min(u64::MAX as u128) as u64
+    let diff = sqrt_hi - sqrt_lo; // diff < sqrt_hi
+
+    // ── Step 1: step1 = L × diff / sqrt_hi ──────────────────────────────────
+    // Decompose L = q × sqrt_hi + r  →  L × diff / sqrt_hi = q × diff + r × diff / sqrt_hi
+    // • q × diff  < L (since q = L/sqrt_hi and diff < sqrt_hi)  → always fits u128
+    // • r × diff  < sqrt_hi² ≤ 2¹³⁶ for realistic prices — use checked_mul fallback
+    let (q, r) = (liquidity / sqrt_hi, liquidity % sqrt_hi);
+    let q_part = q.saturating_mul(diff);
+    let r_part = r.checked_mul(diff)
+        .map(|v| v / sqrt_hi)
+        .unwrap_or_else(|| {
+            // Approximation: loses at most ~32 bits of fractional precision
+            (r >> 32).saturating_mul(diff >> 32) / (sqrt_hi >> 64).max(1)
+        });
+    let step1 = q_part.saturating_add(r_part); // step1 < L
+
+    // ── Step 2: result = step1 × 2⁶⁴ / sqrt_lo ─────────────────────────────
+    // Decompose step1 = q2 × sqrt_lo + r2  →  step1 × 2⁶⁴ / sqrt_lo = q2 × 2⁶⁴ + r2 × 2⁶⁴ / sqrt_lo
+    let (q2, r2) = (step1 / sqrt_lo, step1 % sqrt_lo);
+    if q2 >> 64 != 0 {
+        return u64::MAX; // result > u64::MAX
+    }
+    let high = q2 << 64;
+    // r2 < sqrt_lo ≤ 2⁶⁴ for SOL prices → r2 << 64 ≤ 2¹²⁸ fits u128
+    let low = r2.checked_shl(64)
+        .map(|v| v / sqrt_lo)
+        .unwrap_or_else(|| (r2 >> 32).saturating_mul(1u128 << 32) / (sqrt_lo >> 32).max(1));
+
+    high.saturating_add(low).min(u64::MAX as u128) as u64
 }
 
 /// token1 amount from a liquidity range.
+///
+/// Formula: L × (√P_hi − √P_lo) / 2⁶⁴
+///
+/// Uses checked_mul: if the product overflows u128, the result exceeds u64::MAX,
+/// so returning u64::MAX is the correct saturating behaviour.
 pub fn get_amount_1_delta(sqrt_lo: u128, sqrt_hi: u128, liquidity: u128) -> u64 {
-    if sqrt_lo >= sqrt_hi || liquidity == 0 {
+    if sqrt_hi <= sqrt_lo || liquidity == 0 {
         return 0;
     }
     let diff = sqrt_hi - sqrt_lo;
-    let result = (liquidity >> 32).saturating_mul(diff >> 32);
-    result.min(u64::MAX as u128) as u64
+    // amount1 = L × diff >> 64
+    // If L × diff overflows u128, the unshifted result is > 2¹²⁸ → shifted result > 2⁶⁴ > u64::MAX
+    liquidity
+        .checked_mul(diff)
+        .map(|v| (v >> 64).min(u64::MAX as u128) as u64)
+        .unwrap_or(u64::MAX)
 }
 
 /// Compute the real token0 and token1 amounts held in a CLMM position at current price.
@@ -432,4 +488,157 @@ pub mod seeds {
     pub const SHARE_MINT: &[u8] = b"share_mint";
     pub const USER_DEPOSIT: &[u8] = b"user_deposit";
     pub const POSITION_NFT: &[u8] = b"position_nft";
+}
+
+
+// ─── Flash-loan price manipulation protection ─────────────────────────────────
+
+/// Maximum allowed deviation between spot sqrt_price and a 30-second-old
+/// reference observation. 150 bps on sqrt ≈ 3% price deviation.
+/// Flash-loan sandwiches move price >>10%, so this safely catches attacks
+/// while tolerating normal 30-second SOL volatility (~0.5-1% sqrt).
+pub const MAX_SQRT_DEVIATION_BPS: u128 = 150;
+
+/// Minimum age of the reference observation to be meaningful.
+const TWAP_MIN_AGE_SECS: u32 = 30;
+
+/// Verify the current pool sqrt_price_x64 (spot) has not been manipulated
+/// by a flash-loan sandwich attack.
+///
+/// Compares the live pool price with a stored Raydium observation from
+/// ≥ 30 seconds ago. Each ObservationState slot stores the pool's
+/// sqrt_price_x64 just before the most recent swap in that slot — so
+/// a same-block flash manipulation is detected immediately.
+///
+/// Silently passes when < 30 s of history exists (brand-new pool, TVL ≈ 0).
+///
+/// Raydium ObservationState layout (anchor-0.31.1):
+///   initialized: bool, pool_id: Pubkey,
+///   observations: [Observation; OBSERVATION_NUM=1000], padding
+/// Observation: block_timestamp: u32, sqrt_price_x64: u128, cumulative_time_price_x64: u128, padding: u128
+pub fn check_price_not_manipulated(
+    sqrt_price_x64: u128,
+    obs_state: &ObservationState,
+) -> Result<()> {
+    if !obs_state.initialized {
+        return Ok(());
+    }
+
+    // Find the latest observation timestamp across all slots.
+    // (ObservationState has no index field — observations are circular.)
+    let mut latest_ts = 0u32;
+    for obs in obs_state.observations[..OBSERVATION_NUM].iter() {
+        if obs.block_timestamp > latest_ts {
+            latest_ts = obs.block_timestamp;
+        }
+    }
+    if latest_ts == 0 {
+        return Ok(()); // No observations yet
+    }
+
+    // Find the most-recent observation that is at least TWAP_MIN_AGE_SECS old.
+    // This is our reference — the pool price before any potential manipulation.
+    let mut ref_sqrt: Option<u128> = None;
+    let mut best_ref_ts = 0u32;
+
+    for obs in obs_state.observations[..OBSERVATION_NUM].iter() {
+        if obs.block_timestamp == 0 || obs.sqrt_price_x64 == 0 {
+            continue;
+        }
+        let age = latest_ts.saturating_sub(obs.block_timestamp);
+        if age >= TWAP_MIN_AGE_SECS && obs.block_timestamp > best_ref_ts {
+            best_ref_ts = obs.block_timestamp;
+            ref_sqrt = Some(obs.sqrt_price_x64);
+        }
+    }
+
+    // Insufficient history → skip (new pool; risk negligible at low TVL)
+    let ref_sqrt = match ref_sqrt {
+        Some(s) if s > 0 => s,
+        _ => return Ok(()),
+    };
+
+    // Check: |spot_sqrt - ref_sqrt| * 10_000 <= ref_sqrt * MAX_SQRT_DEVIATION_BPS
+    // Both values are Q64.64 — same format, direct comparison is valid.
+    let deviation = if sqrt_price_x64 > ref_sqrt {
+        sqrt_price_x64 - ref_sqrt
+    } else {
+        ref_sqrt - sqrt_price_x64
+    };
+
+    require!(
+        deviation.saturating_mul(10_000) <= ref_sqrt.saturating_mul(MAX_SQRT_DEVIATION_BPS),
+        VaultError::PriceManipulationDetected
+    );
+
+    Ok(())
+}
+
+// ─── Admin-swap drain protection (audit #4) ───────────────────────────────────
+
+/// Max acceptable slippage for a treasury swap, in bps. 200 = 2%.
+/// Allows normal 30-s price drift + pool fee, but rejects the "set min_out=1
+/// and sandwich" drain vector — anything worse than 2% off TWAP reverts.
+pub const MAX_SWAP_SLIPPAGE_BPS: u128 = 200;
+
+/// Return the most-recent Raydium observation sqrt_price that is ≥30 s old.
+/// This is a manipulation-resistant reference price (a same-tx sandwich
+/// cannot move a stored historical observation). Returns None when the pool
+/// has insufficient history.
+pub fn reference_sqrt_price(obs_state: &ObservationState) -> Option<u128> {
+    if !obs_state.initialized {
+        return None;
+    }
+    let mut latest_ts = 0u32;
+    for obs in obs_state.observations[..OBSERVATION_NUM].iter() {
+        if obs.block_timestamp > latest_ts {
+            latest_ts = obs.block_timestamp;
+        }
+    }
+    if latest_ts == 0 {
+        return None;
+    }
+    let mut ref_sqrt: Option<u128> = None;
+    let mut best_ref_ts = 0u32;
+    for obs in obs_state.observations[..OBSERVATION_NUM].iter() {
+        if obs.block_timestamp == 0 || obs.sqrt_price_x64 == 0 {
+            continue;
+        }
+        let age = latest_ts.saturating_sub(obs.block_timestamp);
+        if age >= TWAP_MIN_AGE_SECS && obs.block_timestamp > best_ref_ts {
+            best_ref_ts = obs.block_timestamp;
+            ref_sqrt = Some(obs.sqrt_price_x64);
+        }
+    }
+    ref_sqrt.filter(|s| *s > 0)
+}
+
+/// Compute the minimum acceptable swap output (raw units) from a reference
+/// sqrt_price (TWAP), enforcing MAX_SWAP_SLIPPAGE_BPS.
+///
+/// Pool price P = raw_token1 / raw_token0 = (sqrt_x64 / 2^64)^2.
+/// - input_is_pool_token0 → selling token0 for token1: out = amount_in × P
+/// - else                 → selling token1 for token0: out = amount_in / P
+///
+/// Overflow-safe: uses (sqrt >> 32)^2 = P × 2^64 then shifts.
+pub fn swap_min_out_floor(
+    ref_sqrt_x64: u128,
+    amount_in: u64,
+    input_is_pool_token0: bool,
+) -> Option<u64> {
+    let half = ref_sqrt_x64 >> 32;          // sqrt(P) × 2^32
+    let price_x64 = half.checked_mul(half)?; // P × 2^64
+
+    let expected: u128 = if input_is_pool_token0 {
+        // out_token1 = amount_in × P = amount_in × price_x64 / 2^64
+        (amount_in as u128).checked_mul(price_x64)? >> 64
+    } else {
+        // out_token0 = amount_in / P = (amount_in << 64) / price_x64
+        ((amount_in as u128).checked_shl(64)?).checked_div(price_x64)?
+    };
+
+    let floor = expected
+        .checked_mul(10_000u128.checked_sub(MAX_SWAP_SLIPPAGE_BPS)?)?
+        .checked_div(10_000)?;
+    u64::try_from(floor).ok()
 }

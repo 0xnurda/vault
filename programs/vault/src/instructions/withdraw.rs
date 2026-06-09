@@ -95,12 +95,11 @@ pub fn handler(ctx: Context<Withdraw>, min_token0_out: u64, min_token1_out: u64)
         );
     }
 
-    let shares_amount = user_deposit.shares;
+    // Use actual share token balance — not the cached user_deposit.shares counter.
+    // This allows shares to be freely transferred between wallets: whoever
+    // holds the share tokens can always redeem them (audit finding #2).
+    let shares_amount = ctx.accounts.user_share_account.amount;
     require!(shares_amount > 0, VaultError::InsufficientShares);
-    require!(
-        ctx.accounts.user_share_account.amount >= shares_amount,
-        VaultError::InsufficientShares
-    );
 
     let total_shares = vault.total_shares;
     require!(total_shares > 0, VaultError::InsufficientShares);
@@ -212,11 +211,10 @@ pub fn handler(ctx: Context<Withdraw>, min_token0_out: u64, min_token1_out: u64)
         .checked_sub(shares_amount)
         .ok_or(error!(VaultError::MathOverflow))?;
 
-    // Update user deposit record
-    user_deposit.shares = user_deposit
-        .shares
-        .checked_sub(shares_amount)
-        .ok_or(error!(VaultError::MathOverflow))?;
+    // Update user deposit record.
+    // Zero out the counter — shares are now redeemed by token balance, not counter.
+    // saturating_sub keeps it valid even if shares were transferred in from elsewhere.
+    user_deposit.shares = user_deposit.shares.saturating_sub(shares_amount);
     user_deposit.updated_at = current_time;
 
     emit!(WithdrawEvent {

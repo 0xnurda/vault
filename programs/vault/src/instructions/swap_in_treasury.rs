@@ -10,7 +10,7 @@ use raydium_clmm_cpi::{
 
 use crate::errors::VaultError;
 use crate::events::SwapEvent;
-use crate::state::{seeds, Vault};
+use crate::state::{reference_sqrt_price, seeds, swap_min_out_floor, Vault};
 
 /// Swap direction enum
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
@@ -30,7 +30,7 @@ pub struct SwapInTreasury<'info> {
         mut,
         seeds = [seeds::VAULT, vault.pool_id.as_ref()],
         bump = vault.bump,
-        constraint = vault.admin == admin.key() @ VaultError::Unauthorized,
+        constraint = vault.is_operator(&admin.key()) @ VaultError::Unauthorized,
     )]
     pub vault: Box<Account<'info, Vault>>,
 
@@ -85,10 +85,30 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
 
     let vault = &ctx.accounts.vault;
 
-    // Swapping with an active position would leave vault.position_token0/token1
-    // stale relative to the post-swap treasury, breaking withdrawal entitlements.
-    // Close the position first, then swap, then open a new position.
-    require!(!vault.has_active_position, VaultError::PositionAlreadyExists);
+    // Treasury swap is safe during an active position:
+    // token0_treasury / token1_treasury are separate accounts from the Raydium
+    // position — swapping only affects treasury balances, not the locked position.
+
+    // ── TWAP-floor: neutralize the admin/operator "min_out=1 + sandwich" drain ──
+    // (audit #4). The contract derives its OWN minimum output from a ≥30-second-old
+    // observation (manipulation-resistant) and rejects the swap if the caller's
+    // minimum_amount_out is below that floor. Even a compromised operator cannot
+    // execute a lossy swap worse than MAX_SWAP_SLIPPAGE_BPS off the honest TWAP.
+    {
+        let obs = ctx.accounts.observation_state.load()?;
+        if let Some(ref_sqrt) = reference_sqrt_price(&obs) {
+            // Is the input mint the pool's token_0?
+            let pool = ctx.accounts.pool_state.load()?;
+            let input_is_pool_token0 =
+                ctx.accounts.input_vault_mint.key() == pool.token_mint_0;
+            drop(pool);
+
+            let floor = swap_min_out_floor(ref_sqrt, amount_in, input_is_pool_token0)
+                .ok_or(error!(VaultError::MathOverflow))?;
+            require!(minimum_amount_out >= floor, VaultError::SlippageExceeded);
+        }
+        // No ≥30s history (brand-new pool) → fall back to caller's minimum_amount_out.
+    }
 
     let (input_treasury, output_treasury) = match direction {
         SwapDirection::Token0ToToken1 => {

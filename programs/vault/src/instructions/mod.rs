@@ -16,6 +16,7 @@ pub mod accept_admin;
 pub mod cancel_rebalance;
 pub mod migrate_vault;
 pub mod sync_position_value;
+pub mod set_operator;
 
 pub use initialize::*;
 pub use deposit_token0::*;
@@ -35,3 +36,4 @@ pub use accept_admin::*;
 pub use cancel_rebalance::*;
 pub use migrate_vault::*;
 pub use sync_position_value::*;
+pub use set_operator::*;

@@ -1,13 +1,13 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, MintTo, Token, TokenAccount, Transfer};
-use raydium_clmm_cpi::states::PersonalPositionState;
+use raydium_clmm_cpi::states::{ObservationState, PersonalPositionState, PoolState};
 
-use crate::constants::{MIN_DEPOSIT_TOKEN0, RAYDIUM_CLMM_PROGRAM_ID};
+use crate::constants::{DEAD_SHARES, MIN_DEPOSIT_TOKEN0};
 use crate::errors::VaultError;
 use crate::events::DepositToken0Event;
 use crate::state::{
-    calculate_position_amounts, read_pool_sqrt_price_x64, read_pool_token_mint_0,
-    read_pool_tick_current, seeds, sqrt_price_to_price, UserDeposit, Vault,
+    calculate_position_amounts, check_price_not_manipulated,
+    seeds, sqrt_price_to_price, UserDeposit, Vault,
 };
 
 #[derive(Accounts)]
@@ -59,20 +59,23 @@ pub struct DepositToken0<'info> {
     )]
     pub user_share_account: Box<Account<'info, TokenAccount>>,
 
-    /// Raydium CLMM pool — price is read on-chain from sqrt_price_x64.
-    /// Must be the pool stored in vault.pool_id.
-    /// CHECK: ownership verified (Raydium CLMM) + key matches vault.pool_id.
+    /// Raydium CLMM pool — typed access prevents raw-bytes breakage on Raydium layout upgrade.
+    /// AccountLoader implicitly validates owner == Raydium CLMM program + correct discriminator.
     #[account(
-        constraint = raydium_pool.owner == &RAYDIUM_CLMM_PROGRAM_ID @ VaultError::InvalidPriceFeed,
         constraint = raydium_pool.key() == vault.pool_id @ VaultError::InvalidPriceFeed,
     )]
-    pub raydium_pool: AccountInfo<'info>,
+    pub raydium_pool: AccountLoader<'info, PoolState>,
 
     /// Raydium personal position PDA: ["position", position_mint].
     /// Validated in handler when has_active_position is true.
     /// Pass any pubkey (e.g. system_program) when there is no active position.
     /// CHECK: key validated in handler via find_program_address when active.
     pub personal_position: UncheckedAccount<'info>,
+
+    /// Raydium CLMM ObservationState for TWAP price manipulation check.
+    /// Must belong to the same pool as vault.pool_id.
+    /// Protects against flash-loan price manipulation (audit finding #1).
+    pub observation_state: AccountLoader<'info, ObservationState>,
 
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
@@ -89,16 +92,12 @@ pub fn handler(ctx: Context<DepositToken0>, amount: u64) -> Result<()> {
     require!(!vault.is_paused, VaultError::VaultPaused);
     require!(!vault.is_rebalancing, VaultError::RebalancingInProgress);
 
-    // Read pool state: price + tick + token ordering
+    // Read pool state via typed AccountLoader — safe against Raydium layout upgrades (audit #6).
     let (token0_price_in_token1, sqrt_price_x64, tick_current, token0_is_pool_token0) = {
-        let pool_data = ctx.accounts.raydium_pool.try_borrow_data()?;
-        let sqrt_price_x64 = read_pool_sqrt_price_x64(&pool_data)
-            .ok_or(error!(VaultError::InvalidPriceFeed))?;
-        let pool_token_mint_0 = read_pool_token_mint_0(&pool_data)
-            .ok_or(error!(VaultError::InvalidPriceFeed))?;
-        let tick_current = read_pool_tick_current(&pool_data)
-            .ok_or(error!(VaultError::InvalidPriceFeed))?;
-        let token0_is_pool_token0 = pool_token_mint_0 == vault.token0_mint;
+        let pool = ctx.accounts.raydium_pool.load()?;
+        let sqrt_price_x64 = pool.sqrt_price_x64;
+        let tick_current = pool.tick_current;
+        let token0_is_pool_token0 = pool.token_mint_0 == vault.token0_mint;
         let price = sqrt_price_to_price(
             sqrt_price_x64,
             token0_is_pool_token0,
@@ -109,6 +108,19 @@ pub fn handler(ctx: Context<DepositToken0>, amount: u64) -> Result<()> {
         (price, sqrt_price_x64, tick_current, token0_is_pool_token0)
     };
     require!(token0_price_in_token1 > 0, VaultError::InvalidPriceFeed);
+
+    // ── Flash-loan price manipulation check (audit #1) ────────────────────────
+    // Verify spot price is within 1.5% of the 30-second TWAP.
+    // If an attacker tries to sandwich this deposit, the deviation will be >>10%
+    // and the transaction will revert before any shares are minted.
+    {
+        let obs = ctx.accounts.observation_state.load()?;
+        require!(
+            obs.pool_id == vault.pool_id,
+            VaultError::InvalidPriceFeed
+        );
+        check_price_not_manipulated(sqrt_price_x64, &obs)?;
+    }
 
     // Compute real-time position amounts (prevents dilution from stale stored values)
     let (pos_token0, pos_token1) = if vault.has_active_position && vault.position_liquidity > 0 {
@@ -142,7 +154,11 @@ pub fn handler(ctx: Context<DepositToken0>, amount: u64) -> Result<()> {
     let deposit_value = vault.token0_to_token1(amount, token0_price_in_token1);
     require!(deposit_value > 0, VaultError::InvalidAmount);
 
-    // Shares to mint
+    // Shares to mint.
+    // On first deposit (total_shares == 0): add DEAD_SHARES phantom shares to total_shares
+    // so the initial price-per-share is 1 + DEAD_SHARES/deposit_value instead of 1.
+    // This prevents a manipulator from depositing 1 unit and locking in an extreme price (audit #7).
+    let is_first_deposit = vault.total_shares == 0;
     let shares_to_mint = vault.calculate_shares_to_mint(deposit_value, current_tvl)?;
     require!(shares_to_mint > 0, VaultError::InvalidAmount);
 
@@ -179,8 +195,11 @@ pub fn handler(ctx: Context<DepositToken0>, amount: u64) -> Result<()> {
     vault.treasury_token0 = vault.treasury_token0
         .checked_add(amount)
         .ok_or(error!(VaultError::MathOverflow))?;
+    // On first deposit, add phantom dead shares (audit #7) before user shares
+    let dead = if is_first_deposit { DEAD_SHARES } else { 0 };
     vault.total_shares = vault.total_shares
         .checked_add(shares_to_mint)
+        .and_then(|v| v.checked_add(dead))
         .ok_or(error!(VaultError::MathOverflow))?;
 
     // Update user deposit record

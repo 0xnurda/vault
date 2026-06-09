@@ -21,7 +21,7 @@ pub struct ClosePosition<'info> {
         mut,
         seeds = [seeds::VAULT, vault.pool_id.as_ref()],
         bump = vault.bump,
-        constraint = vault.admin == admin.key() @ VaultError::Unauthorized,
+        constraint = vault.is_operator(&admin.key()) @ VaultError::Unauthorized,
         constraint = vault.has_active_position @ VaultError::NoActivePosition,
     )]
     pub vault: Box<Account<'info, Vault>>,
@@ -96,48 +96,15 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(ctx: Context<'a, 'b, 'c, 'info, ClosePo
 
     let vault_seeds: &[&[&[u8]]] = &[&[seeds::VAULT, pool_id.as_ref(), &[vault.bump]]];
 
-    // ── CPI 1: collect accumulated fees FIRST (liquidity = 0) ─────────────
-    // Always run — even if liquidity == 0 there may be uncollected fees.
-    // We must apply the 10% protocol split BEFORE mixing with principal.
-    let token0_before_fees = ctx.accounts.token0_treasury.amount;
-    let token1_before_fees = ctx.accounts.token1_treasury.amount;
-
-    let fee_accounts = cpi::accounts::DecreaseLiquidityV2 {
-        nft_owner: ctx.accounts.vault.to_account_info(),
-        nft_account: ctx.accounts.position_nft_account.to_account_info(),
-        personal_position: ctx.accounts.personal_position.to_account_info(),
-        pool_state: ctx.accounts.pool_state.to_account_info(),
-        protocol_position: ctx.accounts.personal_position.to_account_info(),
-        token_vault_0: ctx.accounts.token_vault_0.to_account_info(),
-        token_vault_1: ctx.accounts.token_vault_1.to_account_info(),
-        tick_array_lower: ctx.accounts.tick_array_lower.to_account_info(),
-        tick_array_upper: ctx.accounts.tick_array_upper.to_account_info(),
-        recipient_token_account_0: ctx.accounts.token0_treasury.to_account_info(),
-        recipient_token_account_1: ctx.accounts.token1_treasury.to_account_info(),
-        token_program: ctx.accounts.token_program.to_account_info(),
-        token_program_2022: ctx.accounts.token_program_2022.to_account_info(),
-        memo_program: ctx.accounts.memo_program.to_account_info(),
-        vault_0_mint: ctx.accounts.vault_0_mint.to_account_info(),
-        vault_1_mint: ctx.accounts.vault_1_mint.to_account_info(),
-    };
-    cpi::decrease_liquidity_v2(
-        CpiContext::new_with_signer(
-            ctx.accounts.clmm_program.to_account_info(),
-            fee_accounts,
-            vault_seeds,
-        ).with_remaining_accounts(remaining.clone()),
-        0, 0, 0,
-    )?;
-
-    ctx.accounts.token0_treasury.reload()?;
-    ctx.accounts.token1_treasury.reload()?;
-
-    let total_fees_token0 = ctx.accounts.token0_treasury.amount.saturating_sub(token0_before_fees);
-    let total_fees_token1 = ctx.accounts.token1_treasury.amount.saturating_sub(token1_before_fees);
-    let protocol_fee_token0 = total_fees_token0 / 10;
-    let protocol_fee_token1 = total_fees_token1 / 10;
-
-    // ── CPI 2: remove all remaining liquidity ────────────────────────────
+    // ── Lean close (Kamino-style) ─────────────────────────────────────────
+    // Fees are NOT split here. The keeper bot must call `collect_fees` BEFORE
+    // close_position so the 10% protocol cut is taken on clean fees (via a
+    // separate liquidity=0 CPI). This keeps close_position to ≤2 CPI structs
+    // on one stack frame (one DecreaseLiquidityV2 + one ClosePosition), which
+    // fits in the SBF 4KB stack limit. Any residual fees that come out with the
+    // principal here are negligible (just harvested) and flow to users.
+    //
+    // CPI 1: remove all remaining liquidity (also auto-collects residual fees).
     if liquidity > 0 {
         let decrease_accounts = cpi::accounts::DecreaseLiquidityV2 {
             nft_owner: ctx.accounts.vault.to_account_info(),
@@ -167,6 +134,7 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(ctx: Context<'a, 'b, 'c, 'info, ClosePo
         cpi::decrease_liquidity_v2(decrease_ctx, liquidity, amount_0_min, amount_1_min)?;
     }
 
+    // CPI 2: burn the (now empty) position NFT.
     let close_accounts = cpi::accounts::ClosePosition {
         nft_owner: ctx.accounts.vault.to_account_info(),
         position_nft_mint: ctx.accounts.position_nft_mint.to_account_info(),
@@ -200,13 +168,8 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(ctx: Context<'a, 'b, 'c, 'info, ClosePo
     vault.is_rebalancing = true;
     vault.rebalance_started_at = Clock::get()?.unix_timestamp;
 
-    // Accumulate protocol fees from the fee collection step above.
-    vault.accumulated_protocol_fees_token0 = vault.accumulated_protocol_fees_token0
-        .checked_add(protocol_fee_token0)
-        .ok_or(error!(VaultError::MathOverflow))?;
-    vault.accumulated_protocol_fees_token1 = vault.accumulated_protocol_fees_token1
-        .checked_add(protocol_fee_token1)
-        .ok_or(error!(VaultError::MathOverflow))?;
+    // Note: protocol fee 10% is taken in `collect_fees` (called before close),
+    // not here. close_position is lean — no fee split.
 
     emit!(PositionClosed {
         treasury_token0: vault.treasury_token0,

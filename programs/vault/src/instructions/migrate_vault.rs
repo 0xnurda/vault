@@ -1,6 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{Mint, TokenAccount};
 
+use crate::constants::RAYDIUM_CLMM_PROGRAM_ID;
 use crate::errors::VaultError;
 use crate::state::{seeds, Vault};
 
@@ -57,8 +58,23 @@ pub struct MigrateVault<'info> {
     )]
     pub token1_treasury: Account<'info, TokenAccount>,
 
-    /// The Raydium CLMM pool — its key is vault.pool_id and part of PDA seeds.
-    /// CHECK: Key used for PDA derivation; ownership checked by Raydium constraint in initialize.
+    /// token0 mint — decimals read from here, NOT from handler args (audit #3).
+    #[account(
+        constraint = token0_mint.key() == token0_treasury.mint @ VaultError::InvalidMint,
+    )]
+    pub token0_mint: Account<'info, Mint>,
+
+    /// token1 mint — decimals read from here, NOT from handler args (audit #3).
+    #[account(
+        constraint = token1_mint.key() == token1_treasury.mint @ VaultError::InvalidMint,
+    )]
+    pub token1_mint: Account<'info, Mint>,
+
+    /// The Raydium CLMM pool — validated to be owned by Raydium (audit #3).
+    /// CHECK: Ownership validated against RAYDIUM_CLMM_PROGRAM_ID.
+    #[account(
+        constraint = pool_id_account.owner == &RAYDIUM_CLMM_PROGRAM_ID @ VaultError::InvalidPriceFeed,
+    )]
     pub pool_id_account: AccountInfo<'info>,
 
     pub system_program: Program<'info, System>,
@@ -68,9 +84,23 @@ pub struct MigrateVault<'info> {
 pub fn handler(
     ctx: Context<MigrateVault>,
     protocol_wallet: Pubkey,
-    token0_decimals: u8,
-    token1_decimals: u8,
 ) -> Result<()> {
+    // ── Idempotency: skip if already migrated (audit #3) ─────────────────
+    // A migrated vault is exactly Vault::LEN bytes with a valid pool_id at
+    // the known offset (8 disc + 32 admin + 32 share_mint = 72 → pool_id at 72..104).
+    {
+        let data = ctx.accounts.vault.try_borrow_data()?;
+        if data.len() == Vault::LEN && data.len() >= 104 {
+            let stored_pool_id = Pubkey::from(
+                <[u8; 32]>::try_from(&data[72..104]).unwrap_or([0u8; 32]),
+            );
+            if stored_pool_id == ctx.accounts.pool_id_account.key() {
+                msg!("Vault already migrated to current layout — skipping.");
+                return Ok(());
+            }
+        }
+    }
+
     // ── Step 1: Verify admin from raw bytes ───────────────────────────────
     let stored_admin = {
         let data = ctx.accounts.vault.try_borrow_data()?;
@@ -114,6 +144,9 @@ pub fn handler(
     let pool_id = ctx.accounts.pool_id_account.key();
     let token0_mint = ctx.accounts.token0_treasury.mint;
     let token1_mint = ctx.accounts.token1_treasury.mint;
+    // Read decimals from mint accounts — NOT from args (audit #3 fix)
+    let token0_decimals = ctx.accounts.token0_mint.decimals;
+    let token1_decimals = ctx.accounts.token1_mint.decimals;
 
     let new_vault = Vault {
         admin: ctx.accounts.admin.key(),
@@ -153,6 +186,8 @@ pub fn handler(
         accumulated_protocol_fees_token1: 0,
         // No active rebalance
         rebalance_started_at: 0,
+        // Default operator = admin; rotate later via set_operator
+        operator: ctx.accounts.admin.key(),
     };
 
     // ── Step 6: Serialize and write back ──────────────────────────────────
