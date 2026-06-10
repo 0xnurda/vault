@@ -756,9 +756,34 @@ mod math_tests {
     #[test]
     fn swap_floor_rejects_lowball() {
         // At price 1.0 (sqrt = 2^64), selling 1_000_000 token0 → expect ~1_000_000 token1.
-        // Floor = expected · (1 − 2%) ≈ 980_000. A min_out of 1 must be below the floor.
+        // Floor = expected · (1 − 1%) ≈ 990_000. A min_out of 1 must be below the floor.
         let floor = swap_min_out_floor(Q64, 1_000_000, true).unwrap();
         assert!(floor > 900_000 && floor <= 1_000_000, "floor={}", floor);
         assert!(1 < floor, "min_out=1 must be rejected by the floor");
+    }
+
+    #[test]
+    fn m2_only_dead_shares_does_not_lock_out() {
+        // After everyone withdraws, total_shares is stuck at DEAD_SHARES and TVL ≈ dust.
+        // A large next deposit must NOT overflow — calculate_shares_to_mint must treat
+        // "only dead shares remain" as a fresh start (audit M2).
+        let mut v = Vault::default();
+        v.total_shares = DEAD_SHARES;            // 1000 phantom shares left
+        let big_deposit = 1_000_000_000_000u64;  // 1M USDC-equiv
+        let dust_tvl = 3u64;                     // pennies of leftover value
+
+        // Old buggy path would compute big_deposit × 1000 / 3 → > u64::MAX → MathOverflow.
+        let shares = v.calculate_shares_to_mint(big_deposit, dust_tvl)
+            .expect("must not overflow when only dead shares remain");
+        assert_eq!(shares, big_deposit, "fresh-start: 1:1 share price");
+    }
+
+    #[test]
+    fn shares_mint_normal_ratio() {
+        // Normal case still uses the ratio: deposit × total_shares / tvl.
+        let mut v = Vault::default();
+        v.total_shares = 1_000_000;
+        let shares = v.calculate_shares_to_mint(100, 200).unwrap(); // 100 × 1e6 / 200
+        assert_eq!(shares, 500_000);
     }
 }
