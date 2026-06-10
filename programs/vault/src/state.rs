@@ -642,3 +642,80 @@ pub fn swap_min_out_floor(
         .checked_div(10_000)?;
     u64::try_from(floor).ok()
 }
+
+// ─── Math regression tests (audit checklist #2) ───────────────────────────────
+#[cfg(test)]
+mod math_tests {
+    use super::*;
+
+    const Q64: u128 = 1u128 << 64;
+
+    #[test]
+    fn sqrt_at_tick_zero_is_one() {
+        // price(0) = 1.0 → sqrt_price_x64 = 2^64
+        assert_eq!(get_sqrt_price_at_tick(0), Q64);
+    }
+
+    #[test]
+    fn positive_ticks_not_broken() {
+        // Regression guard: old code returned ~1 for positive ticks.
+        let s_pos = get_sqrt_price_at_tick(28230);
+        let s_neg = get_sqrt_price_at_tick(-28230);
+        assert!(s_pos > Q64, "positive tick must be > 2^64, got {}", s_pos);
+        assert!(s_neg < Q64, "negative tick must be < 2^64, got {}", s_neg);
+        assert!(s_neg < get_sqrt_price_at_tick(0));
+        assert!(get_sqrt_price_at_tick(0) < s_pos, "must be monotonic");
+    }
+
+    #[test]
+    fn sqrt_reciprocal_symmetry() {
+        // price(t)·price(-t) = 1 → sqrt(t) ≈ 2^128 / sqrt(-t).
+        for t in [60i32, 1000, 28230, 100000, 200000] {
+            let s_pos = get_sqrt_price_at_tick(t);
+            let s_neg = get_sqrt_price_at_tick(-t);
+            let expected = u128::MAX / s_pos; // ≈ 2^128 / s_pos
+            let diff = if s_neg > expected { s_neg - expected } else { expected - s_neg };
+            // tolerance 1e-5 relative (our true error is ~1e-10)
+            assert!(
+                diff.saturating_mul(100_000) <= expected.max(1),
+                "tick {} reciprocal off: s_neg={} expected={}", t, s_neg, expected
+            );
+        }
+    }
+
+    #[test]
+    fn amount_1_delta_exact() {
+        // amount1 = L·(sqrt_hi − sqrt_lo) >> 64
+        assert_eq!(get_amount_1_delta(Q64, Q64 + Q64, 1000), 1000);       // diff = 2^64 → L
+        assert_eq!(get_amount_1_delta(Q64, Q64 + (1u128 << 63), 1000), 500); // diff = 2^63 → L/2
+        assert_eq!(get_amount_1_delta(Q64, Q64 + (1u128 << 62), 4000), 1000); // diff = 2^62 → L/4
+    }
+
+    #[test]
+    fn delta_zero_edge_cases() {
+        assert_eq!(get_amount_0_delta(Q64, Q64, 1000), 0);     // lo == hi
+        assert_eq!(get_amount_1_delta(Q64, Q64, 1000), 0);     // lo == hi
+        assert_eq!(get_amount_0_delta(Q64, 2 * Q64, 0), 0);    // L == 0
+        assert_eq!(get_amount_1_delta(Q64, 2 * Q64, 0), 0);    // L == 0
+    }
+
+    #[test]
+    fn amount_0_delta_positive_and_bounded() {
+        // token0 = L·(√hi−√lo)/(√lo·√hi) — positive for a valid in-range span.
+        let lo = Q64;
+        let hi = Q64 + (1u128 << 60);
+        let a0 = get_amount_0_delta(lo, hi, 1_000_000_000);
+        assert!(a0 > 0, "amount0 must be positive for a valid range");
+        // sanity upper bound: amount0 < L for a narrow range above 1.0
+        assert!((a0 as u128) < 1_000_000_000);
+    }
+
+    #[test]
+    fn swap_floor_rejects_lowball() {
+        // At price 1.0 (sqrt = 2^64), selling 1_000_000 token0 → expect ~1_000_000 token1.
+        // Floor = expected · (1 − 2%) ≈ 980_000. A min_out of 1 must be below the floor.
+        let floor = swap_min_out_floor(Q64, 1_000_000, true).unwrap();
+        assert!(floor > 900_000 && floor <= 1_000_000, "floor={}", floor);
+        assert!(1 < floor, "min_out=1 must be rejected by the floor");
+    }
+}

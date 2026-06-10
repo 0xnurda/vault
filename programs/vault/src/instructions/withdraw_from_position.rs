@@ -144,23 +144,64 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
 
     let vault_seeds: &[&[&[u8]]] = &[&[seeds::VAULT, pool_id.as_ref(), &[vault_bump]]];
 
-    // Lean withdraw (Kamino-style): no inline fee collection.
-    // Trading fees are harvested separately by the keeper via `collect_fees`
-    // (10% protocol cut taken there). Here the user simply receives:
-    //   - pro-rata of treasury (minus already-harvested protocol fees), plus
-    //   - pro-rata of their position principal (one DecreaseLiquidityV2 CPI).
-    // This keeps the instruction to a single CPI struct → fits the SBF stack.
+    // ── CPI 1: collect ALL uncollected position fees FIRST (liquidity = 0) ──
+    // Raydium dumps the WHOLE position's owed fees into treasury on any decrease.
+    // We must collect them here and split 10%/90% BEFORE removing the user's
+    // principal — otherwise the withdrawing user would pocket 100% of the
+    // position's fees instead of only their pro-rata share (audit [A]).
+    let token0_before_fees = ctx.accounts.token0_treasury.amount;
+    let token1_before_fees = ctx.accounts.token1_treasury.amount;
+
+    cpi::decrease_liquidity_v2(
+        CpiContext::new_with_signer(
+            ctx.accounts.clmm_program.to_account_info(),
+            cpi::accounts::DecreaseLiquidityV2 {
+                nft_owner: ctx.accounts.vault.to_account_info(),
+                nft_account: ctx.accounts.position_nft_account.to_account_info(),
+                personal_position: ctx.accounts.personal_position.to_account_info(),
+                pool_state: ctx.accounts.pool_state.to_account_info(),
+                protocol_position: ctx.accounts.personal_position.to_account_info(),
+                token_vault_0: ctx.accounts.token_vault_0.to_account_info(),
+                token_vault_1: ctx.accounts.token_vault_1.to_account_info(),
+                tick_array_lower: ctx.accounts.tick_array_lower.to_account_info(),
+                tick_array_upper: ctx.accounts.tick_array_upper.to_account_info(),
+                recipient_token_account_0: ctx.accounts.token0_treasury.to_account_info(),
+                recipient_token_account_1: ctx.accounts.token1_treasury.to_account_info(),
+                token_program: ctx.accounts.token_program.to_account_info(),
+                token_program_2022: ctx.accounts.token_program_2022.to_account_info(),
+                memo_program: ctx.accounts.memo_program.to_account_info(),
+                vault_0_mint: ctx.accounts.vault_0_mint.to_account_info(),
+                vault_1_mint: ctx.accounts.vault_1_mint.to_account_info(),
+            },
+            vault_seeds,
+        )
+        .with_remaining_accounts(remaining.clone()),
+        0, 0, 0,
+    )?;
+
+    ctx.accounts.token0_treasury.reload()?;
+    ctx.accounts.token1_treasury.reload()?;
+
+    // 10% of collected fees → protocol; 90% stays in treasury (pro-rata to ALL holders)
+    let total_fees_token0 = ctx.accounts.token0_treasury.amount.saturating_sub(token0_before_fees);
+    let total_fees_token1 = ctx.accounts.token1_treasury.amount.saturating_sub(token1_before_fees);
+    let new_accumulated_fees_token0 = old_accumulated_fees_token0
+        .checked_add(total_fees_token0 / 10).ok_or(error!(VaultError::MathOverflow))?;
+    let new_accumulated_fees_token1 = old_accumulated_fees_token1
+        .checked_add(total_fees_token1 / 10).ok_or(error!(VaultError::MathOverflow))?;
+
+    // User's pro-rata of treasury (now includes their share of the 90% fees,
+    // and excludes the protocol's accumulated cut).
     let user_accessible_token0 = ctx.accounts.token0_treasury.amount
-        .saturating_sub(old_accumulated_fees_token0);
+        .saturating_sub(new_accumulated_fees_token0);
     let user_accessible_token1 = ctx.accounts.token1_treasury.amount
-        .saturating_sub(old_accumulated_fees_token1);
+        .saturating_sub(new_accumulated_fees_token1);
 
     let user_treasury_token0 = (user_accessible_token0 as u128)
         .checked_mul(shares_amount as u128)
         .and_then(|v| v.checked_div(total_shares as u128))
         .and_then(|v| u64::try_from(v).ok())
         .ok_or(error!(VaultError::MathOverflow))?;
-
     let user_treasury_token1 = (user_accessible_token1 as u128)
         .checked_mul(shares_amount as u128)
         .and_then(|v| v.checked_div(total_shares as u128))
@@ -172,7 +213,8 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
         .and_then(|v| v.checked_div(total_shares as u128))
         .unwrap_or(0);
 
-    // CPI: remove user's pro-rata liquidity (auto-collects residual fees too)
+    // ── CPI 2: remove the user's pro-rata principal ──────────────────────────
+    // token_fees_owed is now 0 (collected in CPI 1), so this returns ONLY principal.
     let token0_before_liq = ctx.accounts.token0_treasury.amount;
     let token1_before_liq = ctx.accounts.token1_treasury.amount;
 
@@ -210,16 +252,8 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
         ctx.accounts.token1_treasury.reload()?;
     }
 
-    let token0_from_position = ctx
-        .accounts
-        .token0_treasury
-        .amount
-        .saturating_sub(token0_before_liq);
-    let token1_from_position = ctx
-        .accounts
-        .token1_treasury
-        .amount
-        .saturating_sub(token1_before_liq);
+    let token0_from_position = ctx.accounts.token0_treasury.amount.saturating_sub(token0_before_liq);
+    let token1_from_position = ctx.accounts.token1_treasury.amount.saturating_sub(token1_before_liq);
 
     let total_token0_out = user_treasury_token0
         .checked_add(token0_from_position)
@@ -283,7 +317,9 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
 
     let current_time = Clock::get()?.unix_timestamp;
 
-    // accumulated_protocol_fees unchanged here — fees are harvested by collect_fees.
+    // Persist the 10% protocol cut taken from fees collected in CPI 1.
+    ctx.accounts.vault.accumulated_protocol_fees_token0 = new_accumulated_fees_token0;
+    ctx.accounts.vault.accumulated_protocol_fees_token1 = new_accumulated_fees_token1;
     ctx.accounts.vault.treasury_token0 = ctx.accounts.token0_treasury.amount;
     ctx.accounts.vault.treasury_token1 = ctx.accounts.token1_treasury.amount;
     ctx.accounts.vault.position_token0 = ctx

@@ -97,11 +97,17 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     {
         let obs = ctx.accounts.observation_state.load()?;
         if let Some(ref_sqrt) = reference_sqrt_price(&obs) {
-            // Is the input mint the pool's token_0?
+            // Determine input-is-pool-token0 from the validated `direction` and the
+            // vault's own token mints (audit [D]) — never trust the passed mint account.
+            // Token0ToToken1 sells vault.token0; we then check which pool side that is.
             let pool = ctx.accounts.pool_state.load()?;
-            let input_is_pool_token0 =
-                ctx.accounts.input_vault_mint.key() == pool.token_mint_0;
+            let pool_token0 = pool.token_mint_0;
             drop(pool);
+            let vault_token0_is_pool_token0 = vault.token0_mint == pool_token0;
+            let input_is_pool_token0 = match direction {
+                SwapDirection::Token0ToToken1 => vault_token0_is_pool_token0,
+                SwapDirection::Token1ToToken0 => !vault_token0_is_pool_token0,
+            };
 
             let floor = swap_min_out_floor(ref_sqrt, amount_in, input_is_pool_token0)
                 .ok_or(error!(VaultError::MathOverflow))?;
