@@ -77,6 +77,13 @@ pub struct MigrateVault<'info> {
     )]
     pub pool_id_account: AccountInfo<'info>,
 
+    /// Raydium personal position PDA, used ONLY to verify there is no live
+    /// liquidity before wiping position state (audit C1). When the old vault has
+    /// has_active_position = true, this must be the real position and have
+    /// liquidity == 0. Pass system_program as a dummy when there is no position.
+    /// CHECK: validated in handler against the old layout's position_mint.
+    pub personal_position: UncheckedAccount<'info>,
+
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
 }
@@ -111,6 +118,66 @@ pub fn handler(
         )
     };
     require!(stored_admin == ctx.accounts.admin.key(), VaultError::Unauthorized);
+
+    // ── C1: refuse to migrate while LIQUIDITY is live ─────────────────────
+    // Migration zeroes position_mint/liquidity. If a position still holds
+    // liquidity on Raydium, the vault would forget its NFT and the funds would
+    // be unreachable (close_position/withdraw_from_position need position_mint).
+    // We gate on position_liquidity (the real danger), not has_active_position:
+    // a stuck flag with zero liquidity (already-drained position) is safe to
+    // migrate, but any non-zero liquidity must be closed first.
+    //
+    // Old-layout offsets (stable — operator was appended at the end):
+    //   ... position_mint[294..326], has_active_position[326],
+    //   position_token0[327..335], position_token1[335..343],
+    //   position_liquidity(u128)[343..359]
+    {
+        let data = ctx.accounts.vault.try_borrow_data()?;
+        if data.len() >= 359 {
+            let liq_bytes: [u8; 16] = data[343..359].try_into()
+                .map_err(|_| error!(VaultError::InvalidPosition))?;
+            let position_liquidity = u128::from_le_bytes(liq_bytes);
+            require!(position_liquidity == 0, VaultError::PositionAlreadyExists);
+        }
+    }
+
+    // ── C1 guard: refuse to wipe a LIVE position ──────────────────────────
+    // Migration zeroes position state. If the old vault has an active position
+    // with real liquidity, wiping position_mint would orphan the NFT + funds on
+    // Raydium forever. Read has_active_position + position_mint from the old
+    // layout (offsets stable across both layouts) and, if active, require the
+    // real on-chain position to be empty (liquidity == 0).
+    // Old/new layout offsets: position_mint at 294..326, has_active_position at 326.
+    {
+        let data = ctx.accounts.vault.try_borrow_data()?;
+        if data.len() > 326 && data[326] == 1 {
+            let position_mint = Pubkey::from(
+                <[u8; 32]>::try_from(&data[294..326])
+                    .map_err(|_| error!(VaultError::InvalidPosition))?,
+            );
+            drop(data);
+
+            // The passed personal_position must be the real PDA for this position.
+            let (expected_pda, _) = Pubkey::find_program_address(
+                &[b"position", position_mint.as_ref()],
+                &RAYDIUM_CLMM_PROGRAM_ID,
+            );
+            require!(
+                ctx.accounts.personal_position.key() == expected_pda,
+                VaultError::InvalidPosition
+            );
+
+            // Read real liquidity from PersonalPositionState: bump(1) + nft_mint(32)
+            // + pool_id(32) + tick_lower(4) + tick_upper(4) = 73 (+8 disc) → liquidity at 81.
+            let pos_data = ctx.accounts.personal_position.try_borrow_data()?;
+            require!(pos_data.len() >= 97, VaultError::InvalidPosition);
+            let liquidity = u128::from_le_bytes(
+                <[u8; 16]>::try_from(&pos_data[81..97])
+                    .map_err(|_| error!(VaultError::InvalidPosition))?,
+            );
+            require!(liquidity == 0, VaultError::PositionAlreadyExists);
+        }
+    }
 
     // ── Step 2: Save discriminator before realloc zeros everything ────────
     let discriminator = {
@@ -188,6 +255,9 @@ pub fn handler(
         rebalance_started_at: 0,
         // Default operator = admin; rotate later via set_operator
         operator: ctx.accounts.admin.key(),
+        // Swap rate-limit window starts fresh (audit H1)
+        swap_window_start: 0,
+        swap_volume_in_window: 0,
     };
 
     // ── Step 6: Serialize and write back ──────────────────────────────────

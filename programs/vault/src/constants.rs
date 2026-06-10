@@ -9,11 +9,13 @@ pub const RAYDIUM_CLMM_PROGRAM_ID: Pubkey =
 pub const WSOL_MINT: Pubkey =
     pubkey!("So11111111111111111111111111111111111111112");
 
-/// Minimum token0 deposit (anti-dust, prevents rounding to 0 shares)
-pub const MIN_DEPOSIT_TOKEN0: u64 = 1_000; // raw units
+/// Minimum token0 deposit (anti-dust, prevents rounding to 0 shares).
+/// token0 = wSOL (9 decimals) → 1_000_000 lamports = 0.001 SOL (audit L4).
+pub const MIN_DEPOSIT_TOKEN0: u64 = 1_000_000; // 0.001 SOL
 
-/// Minimum token1 deposit (anti-dust)
-pub const MIN_DEPOSIT_TOKEN1: u64 = 1_000; // raw units
+/// Minimum token1 deposit (anti-dust).
+/// token1 = USDC (6 decimals) → 1_000 micro = 0.001 USDC.
+pub const MIN_DEPOSIT_TOKEN1: u64 = 1_000; // 0.001 USDC
 
 /// Phantom "dead shares" added to total_shares on the first deposit (audit #7).
 /// These shares are never redeemable — they prevent first-depositor price manipulation

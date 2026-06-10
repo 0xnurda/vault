@@ -1,4 +1,5 @@
 use anchor_lang::prelude::*;
+use crate::constants::DEAD_SHARES;
 use crate::errors::VaultError;
 use raydium_clmm_cpi::states::{ObservationState, OBSERVATION_NUM};
 
@@ -74,6 +75,10 @@ pub struct Vault {
     /// Separate from admin: admin (cold/multisig) sets config; operator (hot bot)
     /// runs day-to-day ops within on-chain guardrails and CANNOT move funds out.
     pub operator: Pubkey,
+    /// Unix timestamp when the current swap rate-limit window started (audit H1).
+    pub swap_window_start: i64,
+    /// token1-denominated swap volume accumulated in the current window (audit H1).
+    pub swap_volume_in_window: u64,
 }
 
 impl Vault {
@@ -109,6 +114,8 @@ impl Vault {
         8  + // accumulated_protocol_fees_token1
         8  + // rebalance_started_at
         32 + // operator (Pubkey)
+        8  + // swap_window_start (i64)
+        8  + // swap_volume_in_window (u64)
         16;  // padding for future fields
 
     /// Calculate TVL in token1 units using on-chain pool price.
@@ -165,7 +172,11 @@ impl Vault {
         deposit_value: u64,
         current_tvl: u64,
     ) -> Result<u64> {
-        if self.total_shares == 0 || current_tvl == 0 {
+        // Fresh start: empty vault, zero TVL, or only phantom dead-shares remain
+        // (everyone withdrew → total_shares stuck at DEAD_SHARES, TVL ≈ dust).
+        // Without this, deposit_value × DEAD_SHARES / dust overflows u64 and the
+        // vault becomes permanently un-depositable (audit M2).
+        if self.total_shares <= DEAD_SHARES || current_tvl == 0 {
             return Ok(deposit_value);
         }
         (deposit_value as u128)
@@ -494,10 +505,10 @@ pub mod seeds {
 // ─── Flash-loan price manipulation protection ─────────────────────────────────
 
 /// Maximum allowed deviation between spot sqrt_price and a 30-second-old
-/// reference observation. 150 bps on sqrt ≈ 3% price deviation.
-/// Flash-loan sandwiches move price >>10%, so this safely catches attacks
-/// while tolerating normal 30-second SOL volatility (~0.5-1% sqrt).
-pub const MAX_SQRT_DEVIATION_BPS: u128 = 150;
+/// reference observation. 75 bps on sqrt ≈ 1.5% price deviation (audit H3,
+/// tightened from 150). Still tolerates normal 30-second drift but shrinks the
+/// residual share-price manipulation window.
+pub const MAX_SQRT_DEVIATION_BPS: u128 = 75;
 
 /// Minimum age of the reference observation to be meaningful.
 const TWAP_MIN_AGE_SECS: u32 = 30;
@@ -510,7 +521,10 @@ const TWAP_MIN_AGE_SECS: u32 = 30;
 /// sqrt_price_x64 just before the most recent swap in that slot — so
 /// a same-block flash manipulation is detected immediately.
 ///
-/// Silently passes when < 30 s of history exists (brand-new pool, TVL ≈ 0).
+/// When `require_reference` is true (the vault already holds funds), a missing
+/// ≥30 s observation is FAIL-SAFE: revert instead of skipping (audit H3). When
+/// false (e.g. the very first deposit into an empty vault) a missing reference
+/// is allowed — there is nothing to manipulate yet and dead-shares cover it.
 ///
 /// Raydium ObservationState layout (anchor-0.31.1):
 ///   initialized: bool, pool_id: Pubkey,
@@ -519,9 +533,16 @@ const TWAP_MIN_AGE_SECS: u32 = 30;
 pub fn check_price_not_manipulated(
     sqrt_price_x64: u128,
     obs_state: &ObservationState,
+    require_reference: bool,
 ) -> Result<()> {
+    // No usable history. Fail-safe when the vault holds funds; allow otherwise.
+    let no_history_result = || -> Result<()> {
+        require!(!require_reference, VaultError::OracleUnavailable);
+        Ok(())
+    };
+
     if !obs_state.initialized {
-        return Ok(());
+        return no_history_result();
     }
 
     // Find the latest observation timestamp across all slots.
@@ -533,7 +554,7 @@ pub fn check_price_not_manipulated(
         }
     }
     if latest_ts == 0 {
-        return Ok(()); // No observations yet
+        return no_history_result();
     }
 
     // Find the most-recent observation that is at least TWAP_MIN_AGE_SECS old.
@@ -552,10 +573,10 @@ pub fn check_price_not_manipulated(
         }
     }
 
-    // Insufficient history → skip (new pool; risk negligible at low TVL)
+    // Insufficient history → fail-safe if vault holds funds, else allow.
     let ref_sqrt = match ref_sqrt {
         Some(s) if s > 0 => s,
-        _ => return Ok(()),
+        _ => return no_history_result(),
     };
 
     // Check: |spot_sqrt - ref_sqrt| * 10_000 <= ref_sqrt * MAX_SQRT_DEVIATION_BPS
@@ -576,10 +597,18 @@ pub fn check_price_not_manipulated(
 
 // ─── Admin-swap drain protection (audit #4) ───────────────────────────────────
 
-/// Max acceptable slippage for a treasury swap, in bps. 200 = 2%.
-/// Allows normal 30-s price drift + pool fee, but rejects the "set min_out=1
-/// and sandwich" drain vector — anything worse than 2% off TWAP reverts.
-pub const MAX_SWAP_SLIPPAGE_BPS: u128 = 200;
+/// Max acceptable slippage for a treasury swap, in bps. 100 = 1% (audit H1).
+/// Tightened from 200. Covers normal 30-s drift + pool fee on a deep pool, but
+/// halves the per-swap value an attacker can bleed via self-sandwich.
+pub const MAX_SWAP_SLIPPAGE_BPS: u128 = 100;
+
+/// Rate-limit window for treasury swaps (audit H1). 1 hour.
+pub const SWAP_WINDOW_SECS: i64 = 3_600;
+
+/// Max swap volume per window as a fraction of treasury value, in bps.
+/// 15000 = 150% of treasury per hour — enough for a full 50/50 rebalance plus
+/// margin, but caps how fast a compromised operator can churn the treasury.
+pub const MAX_SWAP_VOLUME_BPS: u128 = 15_000;
 
 /// Return the most-recent Raydium observation sqrt_price that is ≥30 s old.
 /// This is a manipulation-resistant reference price (a same-tx sandwich
@@ -641,6 +670,20 @@ pub fn swap_min_out_floor(
         .checked_mul(10_000u128.checked_sub(MAX_SWAP_SLIPPAGE_BPS)?)?
         .checked_div(10_000)?;
     u64::try_from(floor).ok()
+}
+
+/// Value `amount` (raw) of a pool token, in pool-token1 units, using the
+/// reference sqrt price. If the amount is pool-token0, multiply by price P;
+/// if it is already pool-token1, return as-is. Used for the swap rate-limit
+/// so volume and treasury are compared in one consistent unit (audit H1).
+pub fn value_in_token1(ref_sqrt_x64: u128, amount: u64, amount_is_pool_token0: bool) -> Option<u128> {
+    if !amount_is_pool_token0 {
+        return Some(amount as u128);
+    }
+    // token1 = amount_token0 × P, where P = (sqrt/2^64)^2 = price_x64 / 2^64.
+    let half = ref_sqrt_x64 >> 32;          // sqrt(P) × 2^32
+    let price_x64 = half.checked_mul(half)?; // P × 2^64
+    (amount as u128).checked_mul(price_x64).map(|v| v >> 64)
 }
 
 // ─── Math regression tests (audit checklist #2) ───────────────────────────────

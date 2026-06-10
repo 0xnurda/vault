@@ -41,12 +41,6 @@ pub enum VaultError {
     #[msg("No pending admin transfer")]
     NoPendingAdmin,
 
-    #[msg("Oracle price is stale (older than 60 seconds)")]
-    StaleOraclePrice,
-
-    #[msg("Oracle price is invalid (zero or negative)")]
-    InvalidOraclePrice,
-
     #[msg("No protocol fees accumulated to extract")]
     NoFeesToExtract,
 
@@ -70,4 +64,10 @@ pub enum VaultError {
 
     #[msg("Price manipulation detected: spot price deviates from TWAP by more than 1.5%")]
     PriceManipulationDetected,
+
+    #[msg("Swap volume exceeds the per-window rate limit")]
+    SwapVolumeExceeded,
+
+    #[msg("Oracle price unavailable: pool has no usable observation history")]
+    OracleUnavailable,
 }

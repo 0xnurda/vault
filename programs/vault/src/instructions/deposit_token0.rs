@@ -119,7 +119,8 @@ pub fn handler(ctx: Context<DepositToken0>, amount: u64) -> Result<()> {
             obs.pool_id == vault.pool_id,
             VaultError::InvalidPriceFeed
         );
-        check_price_not_manipulated(sqrt_price_x64, &obs)?;
+        // Require an oracle reference once the vault holds funds (audit H3).
+        check_price_not_manipulated(sqrt_price_x64, &obs, vault.total_shares > 0)?;
     }
 
     // Compute real-time position amounts (prevents dilution from stale stored values)

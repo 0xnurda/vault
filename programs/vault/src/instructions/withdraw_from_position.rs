@@ -7,12 +7,12 @@ use anchor_spl::token_interface::{
 };
 use raydium_clmm_cpi::{
     cpi,
-    states::{PoolState, PersonalPositionState, TickArrayState},
+    states::{ObservationState, PoolState, PersonalPositionState, TickArrayState},
 };
 
 use crate::errors::VaultError;
 use crate::events::WithdrawEvent;
-use crate::state::{seeds, UserDeposit, Vault};
+use crate::state::{check_price_not_manipulated, seeds, UserDeposit, Vault};
 
 #[derive(Accounts)]
 pub struct WithdrawFromPosition<'info> {
@@ -80,6 +80,10 @@ pub struct WithdrawFromPosition<'info> {
     #[account(mut)]
     pub pool_state: AccountLoader<'info, PoolState>,
 
+    /// Raydium CLMM ObservationState for the TWAP price-manipulation check (audit H2).
+    /// Must belong to the same pool as vault.pool_id.
+    pub observation_state: AccountLoader<'info, ObservationState>,
+
     #[account(
         constraint = position_nft_account.amount == 1,
         constraint = position_nft_account.mint == vault.position_mint @ VaultError::InvalidPosition,
@@ -125,6 +129,19 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     let remaining = ctx.remaining_accounts.to_vec();
 
     require!(!ctx.accounts.vault.is_paused, VaultError::VaultPaused);
+
+    // ── H2: price-manipulation guard ──────────────────────────────────────────
+    // A withdrawer removes pro-rata liquidity at the CURRENT pool ratio. Without
+    // this check an attacker could move the pool price first to skew the token mix
+    // in their favour, shorting the remaining honest holders. Mirror the deposit
+    // guard: spot must be within MAX_SQRT_DEVIATION_BPS of the ≥30s observation.
+    {
+        let sqrt_price_x64 = ctx.accounts.pool_state.load()?.sqrt_price_x64;
+        let obs = ctx.accounts.observation_state.load()?;
+        require!(obs.pool_id == ctx.accounts.vault.pool_id, VaultError::InvalidPriceFeed);
+        // Active position always implies funds → always require an oracle reference.
+        check_price_not_manipulated(sqrt_price_x64, &obs, true)?;
+    }
 
     // Use actual share token balance (audit finding #2 fix).
     let shares_amount = ctx.accounts.user_share_account.amount;

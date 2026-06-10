@@ -10,7 +10,10 @@ use raydium_clmm_cpi::{
 
 use crate::errors::VaultError;
 use crate::events::SwapEvent;
-use crate::state::{reference_sqrt_price, seeds, swap_min_out_floor, Vault};
+use crate::state::{
+    reference_sqrt_price, seeds, swap_min_out_floor, value_in_token1,
+    Vault, MAX_SWAP_VOLUME_BPS, SWAP_WINDOW_SECS,
+};
 
 /// Swap direction enum
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
@@ -89,32 +92,64 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     // token0_treasury / token1_treasury are separate accounts from the Raydium
     // position — swapping only affects treasury balances, not the locked position.
 
-    // ── TWAP-floor: neutralize the admin/operator "min_out=1 + sandwich" drain ──
-    // (audit #4). The contract derives its OWN minimum output from a ≥30-second-old
-    // observation (manipulation-resistant) and rejects the swap if the caller's
-    // minimum_amount_out is below that floor. Even a compromised operator cannot
-    // execute a lossy swap worse than MAX_SWAP_SLIPPAGE_BPS off the honest TWAP.
-    {
+    // ── TWAP-floor + rate-limit: neutralize operator drain (audit #4, H1) ──────
+    // The contract derives its OWN minimum output from a ≥30-second-old observation
+    // (manipulation-resistant) and rejects a swap below that floor. It also caps
+    // cumulative swap volume per window, so a compromised operator cannot bleed the
+    // treasury via repeated near-floor self-sandwich swaps.
+    let (new_window_start, new_window_volume) = {
         let obs = ctx.accounts.observation_state.load()?;
-        if let Some(ref_sqrt) = reference_sqrt_price(&obs) {
-            // Determine input-is-pool-token0 from the validated `direction` and the
-            // vault's own token mints (audit [D]) — never trust the passed mint account.
-            // Token0ToToken1 sells vault.token0; we then check which pool side that is.
-            let pool = ctx.accounts.pool_state.load()?;
-            let pool_token0 = pool.token_mint_0;
-            drop(pool);
-            let vault_token0_is_pool_token0 = vault.token0_mint == pool_token0;
-            let input_is_pool_token0 = match direction {
-                SwapDirection::Token0ToToken1 => vault_token0_is_pool_token0,
-                SwapDirection::Token1ToToken0 => !vault_token0_is_pool_token0,
-            };
+        // Fail-safe: a vault holding real funds must NOT swap without an oracle
+        // reference. We are swapping treasury funds here, so require history.
+        let ref_sqrt = reference_sqrt_price(&obs)
+            .ok_or(error!(VaultError::OracleUnavailable))?;
 
-            let floor = swap_min_out_floor(ref_sqrt, amount_in, input_is_pool_token0)
-                .ok_or(error!(VaultError::MathOverflow))?;
-            require!(minimum_amount_out >= floor, VaultError::SlippageExceeded);
+        // Direction from the validated `direction` + vault mints (audit [D]).
+        let pool = ctx.accounts.pool_state.load()?;
+        let pool_token0 = pool.token_mint_0;
+        drop(pool);
+        let vault_token0_is_pool_token0 = vault.token0_mint == pool_token0;
+        let input_is_pool_token0 = match direction {
+            SwapDirection::Token0ToToken1 => vault_token0_is_pool_token0,
+            SwapDirection::Token1ToToken0 => !vault_token0_is_pool_token0,
+        };
+
+        // 1) Per-swap floor
+        let floor = swap_min_out_floor(ref_sqrt, amount_in, input_is_pool_token0)
+            .ok_or(error!(VaultError::MathOverflow))?;
+        require!(minimum_amount_out >= floor, VaultError::SlippageExceeded);
+
+        // 2) Per-window volume cap (in pool-token1 units)
+        let swap_value = value_in_token1(ref_sqrt, amount_in, input_is_pool_token0)
+            .ok_or(error!(VaultError::MathOverflow))?;
+
+        // Treasury value in pool-token1 units = pool_token1_amount + pool_token0_amount × P
+        let (pool_token0_treasury, pool_token1_treasury) = if vault_token0_is_pool_token0 {
+            (vault.treasury_token0, vault.treasury_token1)
+        } else {
+            (vault.treasury_token1, vault.treasury_token0)
+        };
+        let treasury_value = (pool_token1_treasury as u128).saturating_add(
+            value_in_token1(ref_sqrt, pool_token0_treasury, true).unwrap_or(0),
+        );
+        let cap = treasury_value
+            .checked_mul(MAX_SWAP_VOLUME_BPS)
+            .and_then(|v| v.checked_div(10_000))
+            .unwrap_or(0);
+
+        // Reset the window if it has elapsed, else accumulate.
+        let now = Clock::get()?.unix_timestamp;
+        let (mut window_start, mut window_volume) =
+            (vault.swap_window_start, vault.swap_volume_in_window as u128);
+        if now.saturating_sub(window_start) >= SWAP_WINDOW_SECS {
+            window_start = now;
+            window_volume = 0;
         }
-        // No ≥30s history (brand-new pool) → fall back to caller's minimum_amount_out.
-    }
+        window_volume = window_volume.saturating_add(swap_value);
+        require!(window_volume <= cap, VaultError::SwapVolumeExceeded);
+
+        (window_start, u64::try_from(window_volume).unwrap_or(u64::MAX))
+    };
 
     let (input_treasury, output_treasury) = match direction {
         SwapDirection::Token0ToToken1 => {
@@ -195,6 +230,9 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     let vault = &mut ctx.accounts.vault.as_mut();
     vault.treasury_token0 = ctx.accounts.token0_treasury.amount;
     vault.treasury_token1 = ctx.accounts.token1_treasury.amount;
+    // Persist the swap rate-limit window (audit H1).
+    vault.swap_window_start = new_window_start;
+    vault.swap_volume_in_window = new_window_volume;
 
     emit!(SwapEvent {
         amount_in,
