@@ -70,4 +70,7 @@ pub enum VaultError {
 
     #[msg("Oracle price unavailable: pool has no usable observation history")]
     OracleUnavailable,
+
+    #[msg("Position range invalid: too narrow/wide or not centered on current price")]
+    InvalidPositionRange,
 }

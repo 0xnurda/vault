@@ -10,7 +10,7 @@ use raydium_clmm_cpi::{
 
 use crate::errors::VaultError;
 use crate::events::PositionOpened;
-use crate::state::{seeds, Vault};
+use crate::state::{seeds, validate_position_range, Vault};
 
 #[derive(Accounts)]
 #[instruction(tick_lower_index: i32, tick_upper_index: i32, tick_array_lower_start_index: i32, tick_array_upper_start_index: i32)]
@@ -102,6 +102,17 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     require!(tick_lower_index < tick_upper_index, VaultError::InvalidTickRange);
     require!(liquidity > 0 || amount_0_max > 0, VaultError::InvalidAmount);
     require!(slippage_bps <= MAX_SLIPPAGE_BPS, VaultError::SlippageTooHigh);
+
+    // ── M3: bound the position range (malicious-operator guardrail) ───────────
+    {
+        let pool = ctx.accounts.pool_state.load()?;
+        validate_position_range(
+            tick_lower_index,
+            tick_upper_index,
+            pool.tick_current,
+            pool.tick_spacing as i32,
+        )?;
+    }
 
     let vault = &ctx.accounts.vault;
 

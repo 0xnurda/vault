@@ -1,7 +1,44 @@
 use anchor_lang::prelude::*;
-use crate::constants::DEAD_SHARES;
+use crate::constants::{
+    DEAD_SHARES, MAX_POSITION_WIDTH_SPACINGS, MIN_POSITION_SIDE_PCT, MIN_POSITION_WIDTH_SPACINGS,
+};
 use crate::errors::VaultError;
 use raydium_clmm_cpi::states::{ObservationState, OBSERVATION_NUM};
+
+/// Validate that an open_position range is sane (audit M3). Rejects ranges that
+/// are too narrow, too wide, not straddling the current price, or skewed so the
+/// current tick sits at an edge (near-one-sided). Pool-agnostic: thresholds are
+/// relative to tick_spacing and the range width.
+pub fn validate_position_range(
+    tick_lower: i32,
+    tick_upper: i32,
+    tick_current: i32,
+    tick_spacing: i32,
+) -> Result<()> {
+    require!(tick_lower < tick_upper, VaultError::InvalidTickRange);
+    let width = tick_upper - tick_lower;
+
+    // (a) width within [MIN, MAX] × tick_spacing
+    require!(
+        width >= MIN_POSITION_WIDTH_SPACINGS.saturating_mul(tick_spacing)
+            && width <= MAX_POSITION_WIDTH_SPACINGS.saturating_mul(tick_spacing),
+        VaultError::InvalidPositionRange
+    );
+
+    // (b) current price strictly inside the range (two-sided / active)
+    require!(
+        tick_lower < tick_current && tick_current < tick_upper,
+        VaultError::InvalidPositionRange
+    );
+
+    // (c) centering: each side ≥ MIN_POSITION_SIDE_PCT% of width
+    let left = (tick_current - tick_lower) as i64;
+    let right = (tick_upper - tick_current) as i64;
+    let min_side = (width as i64).saturating_mul(MIN_POSITION_SIDE_PCT) / 100;
+    require!(left >= min_side && right >= min_side, VaultError::InvalidPositionRange);
+
+    Ok(())
+}
 
 /// Main Vault account - stores global state.
 /// One vault per Raydium CLMM pool; PDA seeds = [b"vault", pool_id].
@@ -785,5 +822,44 @@ mod math_tests {
         v.total_shares = 1_000_000;
         let shares = v.calculate_shares_to_mint(100, 200).unwrap(); // 100 × 1e6 / 200
         assert_eq!(shares, 500_000);
+    }
+
+    // ── M3: position range guardrails ─────────────────────────────────────────
+    #[test]
+    fn range_accepts_legit_symmetric() {
+        // Bot opens a symmetric ±range around current price → current ≈ center.
+        // spacing=1, current=0, range ±1000 ticks.
+        assert!(validate_position_range(-1000, 1000, 0, 1).is_ok());
+        // Slightly off-center but within 20% bound: current at 35% of width.
+        assert!(validate_position_range(-1000, 1000, -300, 1).is_ok());
+    }
+
+    #[test]
+    fn range_rejects_out_of_range() {
+        // current price entirely below the range → one-sided.
+        assert!(validate_position_range(1000, 3000, 0, 1).is_err());
+        // current above the range.
+        assert!(validate_position_range(-3000, -1000, 0, 1).is_err());
+    }
+
+    #[test]
+    fn range_rejects_edge_skew() {
+        // current at 95% of the range (near upper edge) → near-one-sided.
+        // width=2000, current at -1000+1900 = 900 → right side = 100 < 20%(400).
+        assert!(validate_position_range(-1000, 1000, 900, 1).is_err());
+    }
+
+    #[test]
+    fn range_rejects_too_narrow() {
+        // width 4 < MIN (8 spacings × spacing 1).
+        assert!(validate_position_range(-2, 2, 0, 1).is_err());
+    }
+
+    #[test]
+    fn range_respects_tick_spacing() {
+        // spacing=60: MIN width = 8×60 = 480. A 300-wide range is too narrow.
+        assert!(validate_position_range(-150, 150, 0, 60).is_err());
+        // 600-wide centered range passes.
+        assert!(validate_position_range(-300, 300, 0, 60).is_ok());
     }
 }
