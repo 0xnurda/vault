@@ -41,7 +41,10 @@ pub struct OpenPosition<'info> {
     )]
     pub token1_treasury: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    #[account(
+        mut,
+        constraint = pool_state.key() == vault.pool_id @ VaultError::InvalidPriceFeed,
+    )]
     pub pool_state: AccountLoader<'info, PoolState>,
 
     #[account(mut)]

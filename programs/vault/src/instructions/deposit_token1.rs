@@ -79,7 +79,7 @@ pub struct DepositToken1<'info> {
     pub system_program: Program<'info, System>,
 }
 
-pub fn handler(ctx: Context<DepositToken1>, amount: u64) -> Result<()> {
+pub fn handler(ctx: Context<DepositToken1>, amount: u64, min_shares_out: u64) -> Result<()> {
     require!(amount > 0, VaultError::InvalidAmount);
     require!(amount >= MIN_DEPOSIT_TOKEN1, VaultError::DepositTooSmall);
 
@@ -150,6 +150,8 @@ pub fn handler(ctx: Context<DepositToken1>, amount: u64) -> Result<()> {
     let is_first_deposit = vault.total_shares == 0;
     let shares_to_mint = vault.calculate_shares_to_mint(deposit_value, current_tvl)?;
     require!(shares_to_mint > 0, VaultError::InvalidAmount);
+    // H-3: deposit slippage protection — caller's floor on minted shares.
+    require!(shares_to_mint >= min_shares_out, VaultError::SlippageExceeded);
 
     // Transfer token1 from user to treasury
     token::transfer(

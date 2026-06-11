@@ -77,7 +77,10 @@ pub struct WithdrawFromPosition<'info> {
     )]
     pub user_token1_account: Box<Account<'info, TokenAccount>>,
 
-    #[account(mut)]
+    #[account(
+        mut,
+        constraint = pool_state.key() == vault.pool_id @ VaultError::InvalidPriceFeed,
+    )]
     pub pool_state: AccountLoader<'info, PoolState>,
 
     /// Raydium CLMM ObservationState for the TWAP price-manipulation check (audit H2).
@@ -128,7 +131,8 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
 ) -> Result<()> {
     let remaining = ctx.remaining_accounts.to_vec();
 
-    require!(!ctx.accounts.vault.is_paused, VaultError::VaultPaused);
+    // H-2: pause MUST NOT block withdrawals — only deposits. Deposited funds are
+    // always redeemable; otherwise admin could freeze user funds forever.
 
     // ── H2: price-manipulation guard ──────────────────────────────────────────
     // A withdrawer removes pro-rata liquidity at the CURRENT pool ratio. Without

@@ -39,12 +39,16 @@ pub struct IncreaseLiquidity<'info> {
     )]
     pub token1_treasury: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    #[account(
+        mut,
+        constraint = pool_state.key() == vault.pool_id @ VaultError::InvalidPriceFeed,
+    )]
     pub pool_state: AccountLoader<'info, PoolState>,
 
     #[account(
         constraint = position_nft_account.amount == 1,
         constraint = position_nft_account.mint == vault.position_mint @ VaultError::InvalidPosition,
+        constraint = position_nft_account.owner == vault.key() @ VaultError::InvalidPosition,
     )]
     pub position_nft_account: Box<InterfaceAccount<'info, TokenAccount>>,
 

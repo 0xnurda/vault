@@ -40,7 +40,10 @@ pub struct ClosePosition<'info> {
     )]
     pub token1_treasury: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    #[account(
+        mut,
+        constraint = pool_state.key() == vault.pool_id @ VaultError::InvalidPriceFeed,
+    )]
     pub pool_state: AccountLoader<'info, PoolState>,
 
     #[account(
@@ -53,6 +56,7 @@ pub struct ClosePosition<'info> {
         mut,
         constraint = position_nft_account.amount == 1,
         constraint = position_nft_account.mint == vault.position_mint @ VaultError::InvalidPosition,
+        constraint = position_nft_account.owner == vault.key() @ VaultError::InvalidPosition,
     )]
     pub position_nft_account: Box<InterfaceAccount<'info, TokenAccount>>,
 
@@ -93,6 +97,13 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(ctx: Context<'a, 'b, 'c, 'info, ClosePo
     let vault = &ctx.accounts.vault;
     let liquidity = ctx.accounts.personal_position.liquidity;
     let pool_id = vault.pool_id;
+
+    // M-1: capture the position's owed fees BEFORE the decrease CPI (which sweeps
+    // them into treasury). We accrue 10% to the protocol here so the cut isn't
+    // forfeited when close is called without a preceding collect_fees. No extra
+    // CPI — just a field read + arithmetic (keeps the SBF stack within limits).
+    let protocol_fee_token0 = ctx.accounts.personal_position.token_fees_owed_0 / 10;
+    let protocol_fee_token1 = ctx.accounts.personal_position.token_fees_owed_1 / 10;
 
     let vault_seeds: &[&[&[u8]]] = &[&[seeds::VAULT, pool_id.as_ref(), &[vault.bump]]];
 
@@ -168,8 +179,11 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(ctx: Context<'a, 'b, 'c, 'info, ClosePo
     vault.is_rebalancing = true;
     vault.rebalance_started_at = Clock::get()?.unix_timestamp;
 
-    // Note: protocol fee 10% is taken in `collect_fees` (called before close),
-    // not here. close_position is lean — no fee split.
+    // M-1: accrue the 10% protocol cut on fees swept out by the decrease.
+    vault.accumulated_protocol_fees_token0 = vault.accumulated_protocol_fees_token0
+        .checked_add(protocol_fee_token0).ok_or(error!(VaultError::MathOverflow))?;
+    vault.accumulated_protocol_fees_token1 = vault.accumulated_protocol_fees_token1
+        .checked_add(protocol_fee_token1).ok_or(error!(VaultError::MathOverflow))?;
 
     emit!(PositionClosed {
         treasury_token0: vault.treasury_token0,

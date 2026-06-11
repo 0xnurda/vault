@@ -83,7 +83,8 @@ pub fn handler(ctx: Context<Withdraw>, min_token0_out: u64, min_token1_out: u64)
     let user_deposit = &mut ctx.accounts.user_deposit;
     let current_time = Clock::get()?.unix_timestamp;
 
-    require!(!vault.is_paused, VaultError::VaultPaused);
+    // H-2: pause MUST NOT block withdrawals — only deposits (see deposit_token*).
+    // Deposited funds stay always-redeemable; otherwise admin could freeze them.
 
     // When a position is active users must use withdraw_from_position (which
     // removes their pro-rata liquidity) instead of this instruction (which only

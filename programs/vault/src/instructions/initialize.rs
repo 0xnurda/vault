@@ -101,8 +101,10 @@ pub fn handler(
     );
 
     // ── Read decimals from Anchor-validated mint accounts ─────────────────────
+    // Bound them so 10^decimals never overflows/panics in the math (audit L-1).
     let token0_decimals = ctx.accounts.token0_mint.decimals;
     let token1_decimals = ctx.accounts.token1_mint.decimals;
+    require!(token0_decimals <= 18 && token1_decimals <= 18, VaultError::InvalidMint);
 
     // ── Initialize vault ──────────────────────────────────────────────────────
     let vault = &mut ctx.accounts.vault;

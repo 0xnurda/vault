@@ -148,14 +148,16 @@ pub mod vault {
 
     // ============ USER INSTRUCTIONS ============
 
-    /// Deposit token0 into vault (price read live from Raydium pool)
-    pub fn deposit_token0(ctx: Context<DepositToken0>, amount: u64) -> Result<()> {
-        instructions::deposit_token0::handler(ctx, amount)
+    /// Deposit token0 into vault (price read live from Raydium pool).
+    /// min_shares_out: revert if fewer shares would be minted (deposit slippage, H-3).
+    pub fn deposit_token0(ctx: Context<DepositToken0>, amount: u64, min_shares_out: u64) -> Result<()> {
+        instructions::deposit_token0::handler(ctx, amount, min_shares_out)
     }
 
-    /// Deposit token1 into vault (price read live from Raydium pool)
-    pub fn deposit_token1(ctx: Context<DepositToken1>, amount: u64) -> Result<()> {
-        instructions::deposit_token1::handler(ctx, amount)
+    /// Deposit token1 into vault (price read live from Raydium pool).
+    /// min_shares_out: revert if fewer shares would be minted (deposit slippage, H-3).
+    pub fn deposit_token1(ctx: Context<DepositToken1>, amount: u64, min_shares_out: u64) -> Result<()> {
+        instructions::deposit_token1::handler(ctx, amount, min_shares_out)
     }
 
     /// Full withdrawal from treasury (burn ALL shares, receive token0/token1 pro-rata).

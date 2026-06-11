@@ -53,7 +53,12 @@ pub struct SwapInTreasury<'info> {
 
     pub amm_config: Box<Account<'info, AmmConfig>>,
 
-    #[account(mut)]
+    /// Must be the vault's own pool — otherwise an operator could route the swap
+    /// through a self-created pool with a fake price and drain the treasury (C-1).
+    #[account(
+        mut,
+        constraint = pool_state.key() == vault.pool_id @ VaultError::InvalidPriceFeed,
+    )]
     pub pool_state: AccountLoader<'info, PoolState>,
 
     #[account(mut)]
@@ -87,6 +92,31 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     require!(minimum_amount_out > 0, VaultError::InvalidAmount);
 
     let vault = &ctx.accounts.vault;
+
+    // ── C-1: bind oracle + amm_config + pool vaults to the vault's real pool ──
+    // pool_state is already constrained == vault.pool_id (accounts struct). Now
+    // verify the observation, amm_config and the Raydium token vaults are THIS
+    // pool's — so an operator cannot supply a self-made pool's oracle/vaults and
+    // bypass the floor/volume-cap (which are computed from the oracle).
+    {
+        let pool = ctx.accounts.pool_state.load()?;
+        require!(
+            pool.observation_key == ctx.accounts.observation_state.key(),
+            VaultError::InvalidPriceFeed
+        );
+        require!(
+            pool.amm_config == ctx.accounts.amm_config.key(),
+            VaultError::InvalidPriceFeed
+        );
+        // input/output_vault must be the pool's own token vaults (either order).
+        let (tv0, tv1) = (pool.token_vault_0, pool.token_vault_1);
+        let inv = ctx.accounts.input_vault.key();
+        let outv = ctx.accounts.output_vault.key();
+        require!(
+            (inv == tv0 && outv == tv1) || (inv == tv1 && outv == tv0),
+            VaultError::InvalidMint
+        );
+    }
 
     // Treasury swap is safe during an active position:
     // token0_treasury / token1_treasury are separate accounts from the Raydium
