@@ -12,7 +12,7 @@ use raydium_clmm_cpi::{
 
 use crate::errors::VaultError;
 use crate::events::WithdrawEvent;
-use crate::state::{check_price_not_manipulated, seeds, UserDeposit, Vault};
+use crate::state::{check_price_not_manipulated, seeds, value_in_token1, UserDeposit, Vault};
 
 #[derive(Accounts)]
 pub struct WithdrawFromPosition<'info> {
@@ -368,12 +368,24 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
         .saturating_sub(shares_amount);
     ctx.accounts.user_deposit.updated_at = current_time;
 
+    // Value the withdrawal in token1 (≈ USDC) units for analytics (audit L1).
+    let withdrawal_value = {
+        let pool = ctx.accounts.pool_state.load()?;
+        let token0_is_pool_token0 = pool.token_mint_0 == ctx.accounts.vault.token0_mint;
+        let sqrt = pool.sqrt_price_x64;
+        drop(pool);
+        let token0_value = value_in_token1(sqrt, total_token0_out, token0_is_pool_token0)
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(0);
+        total_token1_out.saturating_add(token0_value)
+    };
+
     emit!(WithdrawEvent {
         user: ctx.accounts.user.key(),
         shares_burned: shares_amount,
         token0_withdrawn: total_token0_out,
         token1_withdrawn: total_token1_out,
-        withdrawal_value: 0,
+        withdrawal_value,
     });
 
     Ok(())

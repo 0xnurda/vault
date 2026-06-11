@@ -179,12 +179,27 @@ pub fn handler(
         }
     }
 
-    // ── Step 2: Save discriminator before realloc zeros everything ────────
-    let discriminator = {
+    // ── Step 2: Save discriminator + old total_shares before realloc ──────
+    // total_shares lives at a stable offset (264..272) in both layouts, before
+    // any changed field. Preserve it directly so the phantom DEAD_SHARES stay in
+    // the count (audit L2) — recomputing from share_mint.supply would drop them
+    // and nudge the share price.
+    let (discriminator, old_total_shares) = {
         let data = ctx.accounts.vault.try_borrow_data()?;
         let mut disc = [0u8; 8];
         disc.copy_from_slice(&data[0..8]);
-        disc
+        let ts = if data.len() >= 272 {
+            u64::from_le_bytes(<[u8; 8]>::try_from(&data[264..272]).unwrap_or([0u8; 8]))
+        } else {
+            0
+        };
+        (disc, ts)
+    };
+    // Fall back to mint supply if the old counter is somehow zero.
+    let preserved_total_shares = if old_total_shares > 0 {
+        old_total_shares
+    } else {
+        ctx.accounts.share_mint.supply
     };
 
     // ── Step 3: Fund vault if realloc needs more rent ─────────────────────
@@ -227,7 +242,7 @@ pub fn handler(
         token0_decimals,
         token1_decimals,
         // Derive from actual mint supply / token balances
-        total_shares: ctx.accounts.share_mint.supply,
+        total_shares: preserved_total_shares,
         treasury_token0: ctx.accounts.token0_treasury.amount,
         treasury_token1: ctx.accounts.token1_treasury.amount,
         // Canonical PDA bumps as computed by Anchor

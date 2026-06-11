@@ -1,9 +1,10 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Burn, Mint, Token, TokenAccount, Transfer};
+use raydium_clmm_cpi::states::PoolState;
 
 use crate::errors::VaultError;
 use crate::events::WithdrawEvent;
-use crate::state::{seeds, UserDeposit, Vault};
+use crate::state::{seeds, value_in_token1, UserDeposit, Vault};
 
 #[derive(Accounts)]
 pub struct Withdraw<'info> {
@@ -66,6 +67,11 @@ pub struct Withdraw<'info> {
         constraint = user_token1_account.mint == token1_treasury.mint @ VaultError::InvalidMint,
     )]
     pub user_token1_account: Box<Account<'info, TokenAccount>>,
+
+    /// Raydium CLMM pool — read-only, only used to value the withdrawal in token1
+    /// units for the emitted WithdrawEvent (audit L1). Must be vault.pool_id.
+    #[account(constraint = raydium_pool.key() == vault.pool_id @ VaultError::InvalidPriceFeed)]
+    pub raydium_pool: AccountLoader<'info, PoolState>,
 
     pub token_program: Program<'info, Token>,
 }
@@ -217,12 +223,25 @@ pub fn handler(ctx: Context<Withdraw>, min_token0_out: u64, min_token1_out: u64)
     user_deposit.shares = user_deposit.shares.saturating_sub(shares_amount);
     user_deposit.updated_at = current_time;
 
+    // Value the withdrawal in token1 (≈ USDC) units for analytics (audit L1):
+    //   value = token1_out + token0_out × pool_price
+    let withdrawal_value = {
+        let pool = ctx.accounts.raydium_pool.load()?;
+        let token0_is_pool_token0 = pool.token_mint_0 == ctx.accounts.vault.token0_mint;
+        let sqrt = pool.sqrt_price_x64;
+        drop(pool);
+        let token0_value = value_in_token1(sqrt, token0_to_withdraw, token0_is_pool_token0)
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(0);
+        token1_to_withdraw.saturating_add(token0_value)
+    };
+
     emit!(WithdrawEvent {
         user: ctx.accounts.user.key(),
         shares_burned: shares_amount,
         token0_withdrawn: token0_to_withdraw,
         token1_withdrawn: token1_to_withdraw,
-        withdrawal_value: 0,
+        withdrawal_value,
     });
 
     Ok(())
