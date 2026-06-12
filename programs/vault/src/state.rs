@@ -5,6 +5,15 @@ use crate::constants::{
 use crate::errors::VaultError;
 use raydium_clmm_cpi::states::{ObservationState, OBSERVATION_NUM};
 
+// 256-bit integer for bit-exact CLMM math. Isolated in its own module so the
+// construct_uint! macro doesn't collide with anchor_lang's prelude Result/`?`.
+mod u256 {
+    uint::construct_uint! {
+        pub struct U256(4);
+    }
+}
+use u256::U256;
+
 /// Validate that an open_position range is sane (audit M3). Rejects ranges that
 /// are too narrow, too wide, not straddling the current price, or skewed so the
 /// current tick sits at an edge (near-one-sided). Pool-agnostic: thresholds are
@@ -407,65 +416,45 @@ pub fn get_sqrt_price_at_tick(tick: i32) -> u128 {
     }
 }
 
-/// token0 amount from a liquidity range.
+/// token0 amount from a liquidity range — BIT-EXACT vs Raydium (audit H-3).
 ///
-/// Formula: L × (√P_hi − √P_lo) / (√P_hi × √P_lo) × 2⁶⁴
+/// Formula (Uniswap-v3 / Raydium CLMM, round-down):
+///   amount0 = (L << 64) · (√P_hi − √P_lo) / √P_hi / √P_lo   (two nested floors)
 ///
-/// Uses divide-first to avoid intermediate u128 overflow for realistic pool sizes.
-/// The two-step decomposition (div by √P_hi, then × 2⁶⁴ / √P_lo) is numerically
-/// identical to the closed form but keeps each intermediate value below 2¹²⁸.
+/// Computed in U256 so the (L<<64)·diff intermediate (≤ 2¹⁹²) never truncates.
+/// This matches `LiquidityMath.getAmountsFromLiquidity(..., roundUp=false)` to the
+/// raw unit across the full tick range (verified by the SDK diff-test).
 pub fn get_amount_0_delta(sqrt_lo: u128, sqrt_hi: u128, liquidity: u128) -> u64 {
     if sqrt_lo == 0 || sqrt_hi <= sqrt_lo || liquidity == 0 {
         return 0;
     }
-    let diff = sqrt_hi - sqrt_lo; // diff < sqrt_hi
-
-    // ── Step 1: step1 = L × diff / sqrt_hi ──────────────────────────────────
-    // Decompose L = q × sqrt_hi + r  →  L × diff / sqrt_hi = q × diff + r × diff / sqrt_hi
-    // • q × diff  < L (since q = L/sqrt_hi and diff < sqrt_hi)  → always fits u128
-    // • r × diff  < sqrt_hi² ≤ 2¹³⁶ for realistic prices — use checked_mul fallback
-    let (q, r) = (liquidity / sqrt_hi, liquidity % sqrt_hi);
-    let q_part = q.saturating_mul(diff);
-    let r_part = r.checked_mul(diff)
-        .map(|v| v / sqrt_hi)
-        .unwrap_or_else(|| {
-            // Approximation: loses at most ~32 bits of fractional precision
-            (r >> 32).saturating_mul(diff >> 32) / (sqrt_hi >> 64).max(1)
-        });
-    let step1 = q_part.saturating_add(r_part); // step1 < L
-
-    // ── Step 2: result = step1 × 2⁶⁴ / sqrt_lo ─────────────────────────────
-    // Decompose step1 = q2 × sqrt_lo + r2  →  step1 × 2⁶⁴ / sqrt_lo = q2 × 2⁶⁴ + r2 × 2⁶⁴ / sqrt_lo
-    let (q2, r2) = (step1 / sqrt_lo, step1 % sqrt_lo);
-    if q2 >> 64 != 0 {
-        return u64::MAX; // result > u64::MAX
+    let diff = sqrt_hi - sqrt_lo;
+    // num = (L << 64) · diff   (fits u256: result is bounded by u64 for valid inputs)
+    let num = (U256::from(liquidity) << 64u32) * U256::from(diff);
+    // two nested floor divisions, exactly as Raydium's mulDiv(num, .., sqrtB) / sqrtA
+    let amount = num / U256::from(sqrt_hi) / U256::from(sqrt_lo);
+    if amount > U256::from(u64::MAX) {
+        u64::MAX
+    } else {
+        amount.as_u64()
     }
-    let high = q2 << 64;
-    // r2 < sqrt_lo ≤ 2⁶⁴ for SOL prices → r2 << 64 ≤ 2¹²⁸ fits u128
-    let low = r2.checked_shl(64)
-        .map(|v| v / sqrt_lo)
-        .unwrap_or_else(|| (r2 >> 32).saturating_mul(1u128 << 32) / (sqrt_lo >> 32).max(1));
-
-    high.saturating_add(low).min(u64::MAX as u128) as u64
 }
 
-/// token1 amount from a liquidity range.
+/// token1 amount from a liquidity range — BIT-EXACT vs Raydium (audit H-3).
 ///
-/// Formula: L × (√P_hi − √P_lo) / 2⁶⁴
-///
-/// Uses checked_mul: if the product overflows u128, the result exceeds u64::MAX,
-/// so returning u64::MAX is the correct saturating behaviour.
+/// Formula: amount1 = L · (√P_hi − √P_lo) / 2⁶⁴   (round-down)
+/// Computed in U256 to avoid the u128-overflow fallback entirely.
 pub fn get_amount_1_delta(sqrt_lo: u128, sqrt_hi: u128, liquidity: u128) -> u64 {
     if sqrt_hi <= sqrt_lo || liquidity == 0 {
         return 0;
     }
     let diff = sqrt_hi - sqrt_lo;
-    // amount1 = L × diff >> 64
-    // If L × diff overflows u128, the unshifted result is > 2¹²⁸ → shifted result > 2⁶⁴ > u64::MAX
-    liquidity
-        .checked_mul(diff)
-        .map(|v| (v >> 64).min(u64::MAX as u128) as u64)
-        .unwrap_or(u64::MAX)
+    let amount = (U256::from(liquidity) * U256::from(diff)) >> 64u32;
+    if amount > U256::from(u64::MAX) {
+        u64::MAX
+    } else {
+        amount.as_u64()
+    }
 }
 
 /// Compute the real token0 and token1 amounts held in a CLMM position at current price.
