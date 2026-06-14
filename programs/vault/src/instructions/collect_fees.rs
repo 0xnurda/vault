@@ -152,6 +152,11 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(ctx: Context<'a, 'b, 'c, 'info, Collect
     vault.treasury_token0 = ctx.accounts.token0_treasury.amount;
     vault.treasury_token1 = ctx.accounts.token1_treasury.amount;
 
+    // M-1: record the slot so decrease_liquidity/close_position can require fees
+    // were harvested in the same transaction (else Raydium's CPI-accrued fees
+    // would be swept into principal untaxed).
+    vault.last_fee_collection_slot = Clock::get()?.slot;
+
     emit!(FeesCollected {
         total_token0_fees,
         total_token1_fees,

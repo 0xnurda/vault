@@ -98,6 +98,13 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(ctx: Context<'a, 'b, 'c, 'info, ClosePo
     let liquidity = ctx.accounts.personal_position.liquidity;
     let pool_id = vault.pool_id;
 
+    // M-1: require fees were collected this slot so Raydium's CPI-accrued fees
+    // are already harvested (and 10% taken) before close sweeps them into principal.
+    require!(
+        vault.last_fee_collection_slot == Clock::get()?.slot,
+        VaultError::FeesNotCollected
+    );
+
     // M-1: capture the position's owed fees BEFORE the decrease CPI (which sweeps
     // them into treasury). We accrue 10% to the protocol here so the cut isn't
     // forfeited when close is called without a preceding collect_fees. No extra

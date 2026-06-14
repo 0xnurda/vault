@@ -273,6 +273,7 @@ pub fn handler(
         // Swap rate-limit window starts fresh (audit H1)
         swap_window_start: 0,
         swap_volume_in_window: 0,
+        last_fee_collection_slot: 0,
     };
 
     // ── Step 6: Serialize and write back ──────────────────────────────────

@@ -73,4 +73,7 @@ pub enum VaultError {
 
     #[msg("Position range invalid: too narrow/wide or not centered on current price")]
     InvalidPositionRange,
+
+    #[msg("Fees must be collected in the same transaction before decreasing or closing the position")]
+    FeesNotCollected,
 }

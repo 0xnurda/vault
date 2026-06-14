@@ -128,6 +128,11 @@ pub struct Vault {
     pub swap_window_start: i64,
     /// token1-denominated swap volume accumulated in the current window (audit H1).
     pub swap_volume_in_window: u64,
+    /// Slot of the last collect_fees call (audit M-1). decrease_liquidity and
+    /// close_position require this to equal the current slot, forcing the keeper
+    /// to harvest fees in the same transaction so Raydium's CPI-computed accrued
+    /// fees don't get swept into principal untaxed.
+    pub last_fee_collection_slot: u64,
 }
 
 impl Vault {
@@ -165,7 +170,8 @@ impl Vault {
         32 + // operator (Pubkey)
         8  + // swap_window_start (i64)
         8  + // swap_volume_in_window (u64)
-        16;  // padding for future fields
+        8  + // last_fee_collection_slot (u64) — audit M-1
+        8;   // padding for future fields (was 16, consumed 8 for M-1)
 
     /// Calculate TVL in token1 units using on-chain pool price.
     ///

@@ -95,6 +95,14 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
 
     let vault = &ctx.accounts.vault;
 
+    // M-1: require fees were collected this slot. Raydium accrues fresh fees
+    // inside decrease_liquidity_v2 and sweeps them into the withdrawn amounts;
+    // forcing collect_fees in the same tx keeps the 10% protocol cut from leaking.
+    require!(
+        vault.last_fee_collection_slot == Clock::get()?.slot,
+        VaultError::FeesNotCollected
+    );
+
     require!(liquidity > 0, VaultError::InvalidAmount);
     require!(
         liquidity <= vault.position_liquidity,
