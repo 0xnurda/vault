@@ -12,7 +12,7 @@ use crate::errors::VaultError;
 use crate::events::SwapEvent;
 use crate::state::{
     reference_sqrt_price, seeds, swap_min_out_floor, value_in_token1,
-    Vault, MAX_SWAP_VOLUME_BPS, SWAP_WINDOW_SECS,
+    Vault, MAX_SWAP_VOLUME_BPS, SWAP_COOLDOWN_SECS, SWAP_WINDOW_SECS,
 };
 
 /// Swap direction enum
@@ -167,8 +167,16 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
             .and_then(|v| v.checked_div(10_000))
             .unwrap_or(0);
 
-        // Reset the window if it has elapsed, else accumulate.
         let now = Clock::get()?.unix_timestamp;
+
+        // 3) Cooldown between swaps (audit M-3). last_swap_at == 0 (never swapped)
+        // passes naturally since now - 0 is far larger than the cooldown.
+        require!(
+            now.saturating_sub(vault.last_swap_at) >= SWAP_COOLDOWN_SECS,
+            VaultError::SwapCooldownActive
+        );
+
+        // Reset the window if it has elapsed, else accumulate.
         let (mut window_start, mut window_volume) =
             (vault.swap_window_start, vault.swap_volume_in_window as u128);
         if now.saturating_sub(window_start) >= SWAP_WINDOW_SECS {
@@ -260,9 +268,10 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     let vault = &mut ctx.accounts.vault.as_mut();
     vault.treasury_token0 = ctx.accounts.token0_treasury.amount;
     vault.treasury_token1 = ctx.accounts.token1_treasury.amount;
-    // Persist the swap rate-limit window (audit H1).
+    // Persist the swap rate-limit window (audit H1) and cooldown stamp (audit M-3).
     vault.swap_window_start = new_window_start;
     vault.swap_volume_in_window = new_window_volume;
+    vault.last_swap_at = Clock::get()?.unix_timestamp;
 
     emit!(SwapEvent {
         amount_in,

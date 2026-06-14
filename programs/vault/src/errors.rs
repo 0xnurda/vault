@@ -76,4 +76,7 @@ pub enum VaultError {
 
     #[msg("Fees must be collected in the same transaction before decreasing or closing the position")]
     FeesNotCollected,
+
+    #[msg("Swap cooldown active: too soon since the last treasury swap")]
+    SwapCooldownActive,
 }

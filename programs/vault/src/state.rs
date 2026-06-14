@@ -133,6 +133,11 @@ pub struct Vault {
     /// to harvest fees in the same transaction so Raydium's CPI-computed accrued
     /// fees don't get swept into principal untaxed.
     pub last_fee_collection_slot: u64,
+    /// Unix timestamp of the last treasury swap (audit M-3). Enforces a cooldown
+    /// between swaps so a compromised operator cannot drain the whole per-window
+    /// volume cap in a single block — the limit is spread over time, giving the
+    /// admin a window to detect and rotate the operator key.
+    pub last_swap_at: i64,
 }
 
 impl Vault {
@@ -171,7 +176,7 @@ impl Vault {
         8  + // swap_window_start (i64)
         8  + // swap_volume_in_window (u64)
         8  + // last_fee_collection_slot (u64) — audit M-1
-        8;   // padding for future fields (was 16, consumed 8 for M-1)
+        8;   // last_swap_at (i64) — audit M-3 (consumed remaining padding; LEN unchanged)
 
     /// Calculate TVL in token1 units using on-chain pool price.
     ///
@@ -624,9 +629,16 @@ pub const MAX_SWAP_SLIPPAGE_BPS: u128 = 100;
 pub const SWAP_WINDOW_SECS: i64 = 3_600;
 
 /// Max swap volume per window as a fraction of treasury value, in bps.
-/// 15000 = 150% of treasury per hour — enough for a full 50/50 rebalance plus
-/// margin, but caps how fast a compromised operator can churn the treasury.
-pub const MAX_SWAP_VOLUME_BPS: u128 = 15_000;
+/// 10000 = 100% of treasury per hour (audit M-3, tightened from 15000/150%).
+/// Still covers two full one-sided 50/50 rebalances per hour, but cuts the
+/// worst-case self-sandwich drain to ≈1%/hr (cap × MAX_SWAP_SLIPPAGE_BPS).
+pub const MAX_SWAP_VOLUME_BPS: u128 = 10_000;
+
+/// Minimum seconds between two treasury swaps (audit M-3). A legitimate
+/// rebalance performs a single swap, so this never blocks normal operation;
+/// it only stops a compromised operator from front-loading the entire window
+/// cap in one block, spreading any drain over time so the admin can react.
+pub const SWAP_COOLDOWN_SECS: i64 = 60;
 
 /// Return the most-recent Raydium observation sqrt_price that is ≥30 s old.
 /// This is a manipulation-resistant reference price (a same-tx sandwich

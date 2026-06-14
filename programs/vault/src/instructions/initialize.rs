@@ -114,6 +114,7 @@ pub fn handler(
     vault.swap_window_start = 0;
     vault.swap_volume_in_window = 0;
     vault.last_fee_collection_slot = 0;
+    vault.last_swap_at = 0;
     vault.share_mint = ctx.accounts.share_mint.key();
     vault.pool_id = ctx.accounts.pool.key();
     vault.token0_mint = token0_key;

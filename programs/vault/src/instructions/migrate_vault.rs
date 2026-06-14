@@ -274,6 +274,7 @@ pub fn handler(
         swap_window_start: 0,
         swap_volume_in_window: 0,
         last_fee_collection_slot: 0,
+        last_swap_at: 0,
     };
 
     // ── Step 6: Serialize and write back ──────────────────────────────────
