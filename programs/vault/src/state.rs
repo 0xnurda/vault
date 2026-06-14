@@ -5,14 +5,17 @@ use crate::constants::{
 use crate::errors::VaultError;
 use raydium_clmm_cpi::states::{ObservationState, OBSERVATION_NUM};
 
-// 256-bit integer for bit-exact CLMM math. Isolated in its own module so the
-// construct_uint! macro doesn't collide with anchor_lang's prelude Result/`?`.
-mod u256 {
+// Fixed-width integers for bit-exact CLMM math. Isolated in their own module so
+// the construct_uint! macro doesn't collide with anchor_lang's prelude Result/`?`.
+mod bignum {
     uint::construct_uint! {
         pub struct U256(4);
     }
+    uint::construct_uint! {
+        pub struct U128(2);
+    }
 }
-use u256::U256;
+use bignum::{U128, U256};
 
 /// Validate that an open_position range is sane (audit M3). Rejects ranges that
 /// are too narrow, too wide, not straddling the current price, or skewed so the
@@ -343,77 +346,46 @@ pub fn sqrt_price_to_price(
 
 // ─── CLMM position amount math ─────────────────────────────────────────────
 
-/// Multiply two Q128.128 fixed-point values and return the high 128 bits.
-/// Implements (a × b) >> 128 using four u64-limb arithmetic to avoid overflow.
-pub fn mul_shift_128(a: u128, b: u128) -> u128 {
-    let a_lo = a & u64::MAX as u128;
-    let a_hi = a >> 64;
-    let b_lo = b & u64::MAX as u128;
-    let b_hi = b >> 64;
-
-    let lo_lo = a_lo * b_lo;
-    let lo_hi = a_lo * b_hi;
-    let hi_lo = a_hi * b_lo;
-    let hi_hi = a_hi * b_hi;
-
-    let mid_carry = (lo_lo >> 64)
-        .wrapping_add(lo_hi & u64::MAX as u128)
-        .wrapping_add(hi_lo & u64::MAX as u128);
-
-    hi_hi
-        .wrapping_add(lo_hi >> 64)
-        .wrapping_add(hi_lo >> 64)
-        .wrapping_add(mid_carry >> 64)
-}
-
-/// Convert tick index to sqrt_price_x64 (Q64.64).
-/// Uses the Uniswap v3 / Raydium CLMM precomputed ratio table.
+/// Convert tick index to sqrt_price_x64 (Q64.64) — BIT-EXACT port of Raydium's
+/// on-chain `tick_math::get_sqrt_price_at_tick` (audit H-3).
+///
+/// Verified to match `SqrtPriceMath.getSqrtPriceX64FromTick` (Raydium SDK = the
+/// on-chain program) to the ULP across the entire tick range. Differs from the
+/// Uniswap Q96 table: Raydium uses 64-bit-truncated constants, starts the even
+/// case at 2^64, shifts by 64 (not 128), and inverts positive ticks via
+/// U128::MAX / ratio with NO final rounding.
 pub fn get_sqrt_price_at_tick(tick: i32) -> u128 {
-    let abs_tick = tick.unsigned_abs() as u128;
+    let abs_tick = tick.unsigned_abs();
 
-    let mut ratio: u128 = if abs_tick & 0x1 != 0 {
-        0xfffcb933bd6fad37aa2d162d1a594001
+    let mut ratio = if abs_tick & 0x1 != 0 {
+        U128::from(0xfffcb933bd6fb800u128)
     } else {
-        u128::MAX
+        U128::from(1u128) << 64
     };
-
-    if abs_tick & 0x2      != 0 { ratio = mul_shift_128(ratio, 0xfff97272373d413259a46990580e213a); }
-    if abs_tick & 0x4      != 0 { ratio = mul_shift_128(ratio, 0xfff2e50f5f656932ef12357cf3c7fdcc); }
-    if abs_tick & 0x8      != 0 { ratio = mul_shift_128(ratio, 0xffe5caca7e10e4e61c3624eaa0941cd0); }
-    if abs_tick & 0x10     != 0 { ratio = mul_shift_128(ratio, 0xffcb9843d60f6159c9db58835c926644); }
-    if abs_tick & 0x20     != 0 { ratio = mul_shift_128(ratio, 0xff973b41fa98c081472e6896dfb254c0); }
-    if abs_tick & 0x40     != 0 { ratio = mul_shift_128(ratio, 0xff2ea16466c96a3843ec78b326b52861); }
-    if abs_tick & 0x80     != 0 { ratio = mul_shift_128(ratio, 0xfe5dee046a99a2a811c461f1969c3053); }
-    if abs_tick & 0x100    != 0 { ratio = mul_shift_128(ratio, 0xfcbe86c7900a88aedcffc83b479aa3a4); }
-    if abs_tick & 0x200    != 0 { ratio = mul_shift_128(ratio, 0xf987a7253ac413176f2b074cf7815e54); }
-    if abs_tick & 0x400    != 0 { ratio = mul_shift_128(ratio, 0xf3392b0822b70005940c7a398e4b70f3); }
-    if abs_tick & 0x800    != 0 { ratio = mul_shift_128(ratio, 0xe7159475a2c29b7443b29c7fa6e889d9); }
-    if abs_tick & 0x1000   != 0 { ratio = mul_shift_128(ratio, 0xd097f3bdfd2022b8845ad8f792aa5825); }
-    if abs_tick & 0x2000   != 0 { ratio = mul_shift_128(ratio, 0xa9f746462d870fdf8a65dc1f90e061e5); }
-    if abs_tick & 0x4000   != 0 { ratio = mul_shift_128(ratio, 0x70d869a156d2a1b890bb3df62baf32f7); }
-    if abs_tick & 0x8000   != 0 { ratio = mul_shift_128(ratio, 0x31be135f97d08fd981231505542fcfa6); }
-    if abs_tick & 0x10000  != 0 { ratio = mul_shift_128(ratio, 0x9aa508b5b7a84e1c677de54f3e99bc9);  }
-    if abs_tick & 0x20000  != 0 { ratio = mul_shift_128(ratio, 0x5d6af8dedb81196699c329225ee604);   }
-    if abs_tick & 0x40000  != 0 { ratio = mul_shift_128(ratio, 0x2216e584f5fa1ea926041bedfe98);     }
-    if abs_tick & 0x80000  != 0 { ratio = mul_shift_128(ratio, 0x48a170391f7dc42444e8fa2);          }
-
-    // Convert Q128.128 ratio → Q64.64 sqrt price. The constant table encodes
-    // ratios < 1, so this is the sqrt price for the NEGATIVE-tick direction.
-    let frac = ratio & ((1u128 << 64) - 1);
-    let neg_sqrt_x64 = (ratio >> 64) + if frac != 0 { 1 } else { 0 };
+    if abs_tick & 0x2     != 0 { ratio = (ratio * U128::from(0xfff97272373d4000u128)) >> 64 }
+    if abs_tick & 0x4     != 0 { ratio = (ratio * U128::from(0xfff2e50f5f657000u128)) >> 64 }
+    if abs_tick & 0x8     != 0 { ratio = (ratio * U128::from(0xffe5caca7e10f000u128)) >> 64 }
+    if abs_tick & 0x10    != 0 { ratio = (ratio * U128::from(0xffcb9843d60f7000u128)) >> 64 }
+    if abs_tick & 0x20    != 0 { ratio = (ratio * U128::from(0xff973b41fa98e800u128)) >> 64 }
+    if abs_tick & 0x40    != 0 { ratio = (ratio * U128::from(0xff2ea16466c9b000u128)) >> 64 }
+    if abs_tick & 0x80    != 0 { ratio = (ratio * U128::from(0xfe5dee046a9a3800u128)) >> 64 }
+    if abs_tick & 0x100   != 0 { ratio = (ratio * U128::from(0xfcbe86c7900bb000u128)) >> 64 }
+    if abs_tick & 0x200   != 0 { ratio = (ratio * U128::from(0xf987a7253ac65800u128)) >> 64 }
+    if abs_tick & 0x400   != 0 { ratio = (ratio * U128::from(0xf3392b0822bb6000u128)) >> 64 }
+    if abs_tick & 0x800   != 0 { ratio = (ratio * U128::from(0xe7159475a2caf000u128)) >> 64 }
+    if abs_tick & 0x1000  != 0 { ratio = (ratio * U128::from(0xd097f3bdfd2f2000u128)) >> 64 }
+    if abs_tick & 0x2000  != 0 { ratio = (ratio * U128::from(0xa9f746462d9f8000u128)) >> 64 }
+    if abs_tick & 0x4000  != 0 { ratio = (ratio * U128::from(0x70d869a156f31c00u128)) >> 64 }
+    if abs_tick & 0x8000  != 0 { ratio = (ratio * U128::from(0x31be135f97ed3200u128)) >> 64 }
+    if abs_tick & 0x10000 != 0 { ratio = (ratio * U128::from(0x9aa508b5b85a500u128)) >> 64 }
+    if abs_tick & 0x20000 != 0 { ratio = (ratio * U128::from(0x5d6af8dedc582cu128)) >> 64 }
+    if abs_tick & 0x40000 != 0 { ratio = (ratio * U128::from(0x2216e584f5fau128)) >> 64 }
 
     if tick > 0 {
-        // Positive tick: invert in x64 space. sqrt_pos = 1 / sqrt_neg, which in
-        // Q64.64 is sqrt_pos_x64 = 2^128 / sqrt_neg_x64. Since 2^128 doesn't fit
-        // u128, use floor((2^128 − 1) / x) — error ≤ 1 ulp (verified ~2e-10).
-        //
-        // NOTE: the previous `u128::MAX / ratio` inverted the Q128 ratio (2^128
-        // numerator) instead of the Q64 sqrt price, returning ~1 for all positive
-        // ticks. That was correct only because SOL/USDC sits at negative ticks.
-        (u128::MAX / neg_sqrt_x64).max(1)
-    } else {
-        neg_sqrt_x64
+        ratio = U128::MAX / ratio;
     }
+
+    ratio.as_u128()
 }
 
 /// token0 amount from a liquidity range — BIT-EXACT vs Raydium (audit H-3).
