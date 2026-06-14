@@ -7,7 +7,7 @@ use crate::errors::VaultError;
 use crate::events::DepositToken1Event;
 use crate::state::{
     calculate_position_amounts, check_price_not_manipulated,
-    seeds, sqrt_price_to_price, UserDeposit, Vault,
+    seeds, sqrt_price_to_price, UserDeposit, Vault, MAX_SQRT_DEVIATION_BPS,
 };
 
 #[derive(Accounts)]
@@ -112,7 +112,12 @@ pub fn handler(ctx: Context<DepositToken1>, amount: u64, min_shares_out: u64) ->
         let obs = ctx.accounts.observation_state.load()?;
         require!(obs.pool_id == vault.pool_id, VaultError::InvalidPriceFeed);
         // Require an oracle reference once the vault holds funds (audit H3).
-        check_price_not_manipulated(sqrt_price_x64, &obs, vault.total_shares > 0)?;
+        check_price_not_manipulated(
+            sqrt_price_x64,
+            &obs,
+            vault.total_shares > 0,
+            MAX_SQRT_DEVIATION_BPS,
+        )?;
     }
 
     // Compute real-time position amounts

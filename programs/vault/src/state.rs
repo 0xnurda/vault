@@ -508,11 +508,20 @@ pub mod seeds {
 
 // ─── Flash-loan price manipulation protection ─────────────────────────────────
 
-/// Maximum allowed deviation between spot sqrt_price and a 30-second-old
-/// reference observation. 75 bps on sqrt ≈ 1.5% price deviation (audit H3,
-/// tightened from 150). Still tolerates normal 30-second drift but shrinks the
-/// residual share-price manipulation window.
-pub const MAX_SQRT_DEVIATION_BPS: u128 = 75;
+/// Maximum allowed deviation between spot sqrt_price and a ≥30-second-old
+/// reference observation, for DEPOSITS. 250 bps on sqrt ≈ 5% price deviation
+/// (audit M-2, widened from 75/1.5%). The 1.5% band caused false reverts during
+/// normal SOL volatility over the 30-s window; 5% still makes a flash-loan
+/// sandwich uneconomical on a deep pool (moving price 5% costs far more in
+/// slippage than any share-mint gain) while letting legitimate deposits through.
+pub const MAX_SQRT_DEVIATION_BPS: u128 = 250;
+
+/// Softer deviation band for WITHDRAWALS (audit M-2). 500 bps on sqrt ≈ 10%
+/// price. Withdrawals get a wider band so volatility can never lock a user's
+/// funds in — being unable to exit is worse UX than the marginal extra
+/// manipulation room, and a withdrawer who moves the pool to extract more
+/// burns most of the gain in slippage + the protocol fee.
+pub const MAX_SQRT_DEVIATION_WITHDRAW_BPS: u128 = 500;
 
 /// Minimum age of the reference observation to be meaningful.
 const TWAP_MIN_AGE_SECS: u32 = 30;
@@ -538,6 +547,7 @@ pub fn check_price_not_manipulated(
     sqrt_price_x64: u128,
     obs_state: &ObservationState,
     require_reference: bool,
+    max_deviation_bps: u128,
 ) -> Result<()> {
     // No usable history. Fail-safe when the vault holds funds; allow otherwise.
     let no_history_result = || -> Result<()> {
@@ -583,20 +593,24 @@ pub fn check_price_not_manipulated(
         _ => return no_history_result(),
     };
 
-    // Check: |spot_sqrt - ref_sqrt| * 10_000 <= ref_sqrt * MAX_SQRT_DEVIATION_BPS
     // Both values are Q64.64 — same format, direct comparison is valid.
-    let deviation = if sqrt_price_x64 > ref_sqrt {
-        sqrt_price_x64 - ref_sqrt
-    } else {
-        ref_sqrt - sqrt_price_x64
-    };
-
     require!(
-        deviation.saturating_mul(10_000) <= ref_sqrt.saturating_mul(MAX_SQRT_DEVIATION_BPS),
+        sqrt_within_deviation(sqrt_price_x64, ref_sqrt, max_deviation_bps),
         VaultError::PriceManipulationDetected
     );
 
     Ok(())
+}
+
+/// True iff `spot_sqrt` is within `max_deviation_bps` (on the sqrt price) of
+/// `ref_sqrt`: |spot - ref| * 10_000 <= ref * bps. Saturating, overflow-safe.
+pub fn sqrt_within_deviation(spot_sqrt: u128, ref_sqrt: u128, max_deviation_bps: u128) -> bool {
+    let deviation = if spot_sqrt > ref_sqrt {
+        spot_sqrt - ref_sqrt
+    } else {
+        ref_sqrt - spot_sqrt
+    };
+    deviation.saturating_mul(10_000) <= ref_sqrt.saturating_mul(max_deviation_bps)
 }
 
 // ─── Admin-swap drain protection (audit #4) ───────────────────────────────────
@@ -828,5 +842,37 @@ mod math_tests {
         assert!(validate_position_range(-150, 150, 0, 60).is_err());
         // 600-wide centered range passes.
         assert!(validate_position_range(-300, 300, 0, 60).is_ok());
+    }
+
+    #[test]
+    fn deviation_band_deposit_vs_withdraw() {
+        // bps are on the sqrt price; price deviation ≈ 2× sqrt deviation.
+        let reference = 1_000_000u128;
+        let within = |pct_sqrt: i64, bps: u128| {
+            let spot = (reference as i64 + reference as i64 * pct_sqrt / 100) as u128;
+            sqrt_within_deviation(spot, reference, bps)
+        };
+
+        // Deposit band (250 bps sqrt ≈ 5% price): tolerates normal volatility...
+        assert!(within(2, MAX_SQRT_DEVIATION_BPS));   // +2% sqrt — passes
+        assert!(within(-2, MAX_SQRT_DEVIATION_BPS));  // symmetric
+        // ...but still rejects a large flash move.
+        assert!(!within(4, MAX_SQRT_DEVIATION_BPS));  // +4% sqrt > 2.5% band
+
+        // Withdraw band (500 bps ≈ 10% price) is strictly softer: a move that
+        // would block a deposit still lets the user exit.
+        assert!(within(4, MAX_SQRT_DEVIATION_WITHDRAW_BPS));
+        assert!(within(-4, MAX_SQRT_DEVIATION_WITHDRAW_BPS));
+        // Withdraw band is wider than deposit band.
+        assert!(MAX_SQRT_DEVIATION_WITHDRAW_BPS > MAX_SQRT_DEVIATION_BPS);
+    }
+
+    #[test]
+    fn deviation_band_exact_boundary() {
+        // Exactly at the band edge passes; one unit past fails.
+        let reference = 10_000_000u128;
+        // 250 bps of 10_000_000 = 250_000 absolute sqrt deviation allowed.
+        assert!(sqrt_within_deviation(reference + 250_000, reference, MAX_SQRT_DEVIATION_BPS));
+        assert!(!sqrt_within_deviation(reference + 250_001, reference, MAX_SQRT_DEVIATION_BPS));
     }
 }

@@ -12,7 +12,7 @@ use raydium_clmm_cpi::{
 
 use crate::errors::VaultError;
 use crate::events::WithdrawEvent;
-use crate::state::{check_price_not_manipulated, seeds, value_in_token1, UserDeposit, Vault};
+use crate::state::{check_price_not_manipulated, seeds, value_in_token1, UserDeposit, Vault, MAX_SQRT_DEVIATION_WITHDRAW_BPS};
 
 #[derive(Accounts)]
 pub struct WithdrawFromPosition<'info> {
@@ -144,7 +144,8 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
         let obs = ctx.accounts.observation_state.load()?;
         require!(obs.pool_id == ctx.accounts.vault.pool_id, VaultError::InvalidPriceFeed);
         // Active position always implies funds → always require an oracle reference.
-        check_price_not_manipulated(sqrt_price_x64, &obs, true)?;
+        // Softer band on withdraw (audit M-2): volatility must never lock a user out.
+        check_price_not_manipulated(sqrt_price_x64, &obs, true, MAX_SQRT_DEVIATION_WITHDRAW_BPS)?;
     }
 
     // Use actual share token balance (audit finding #2 fix).
