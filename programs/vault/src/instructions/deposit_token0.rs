@@ -1,12 +1,12 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, MintTo, Token, TokenAccount, Transfer};
-use raydium_clmm_cpi::states::{ObservationState, PersonalPositionState, PoolState};
+use raydium_clmm_cpi::states::{PersonalPositionState, PoolState};
 
 use crate::constants::{DEAD_SHARES, MIN_DEPOSIT_TOKEN0};
 use crate::errors::VaultError;
 use crate::events::DepositToken0Event;
 use crate::state::{
-    calculate_position_amounts, check_price_not_manipulated,
+    calculate_position_amounts, check_price_not_manipulated, observation_pool_id,
     seeds, sqrt_price_to_price, UserDeposit, Vault, MAX_SQRT_DEVIATION_BPS,
 };
 
@@ -72,10 +72,10 @@ pub struct DepositToken0<'info> {
     /// CHECK: key validated in handler via find_program_address when active.
     pub personal_position: UncheckedAccount<'info>,
 
-    /// Raydium CLMM ObservationState for TWAP price manipulation check.
-    /// Must belong to the same pool as vault.pool_id.
-    /// Protects against flash-loan price manipulation (audit finding #1).
-    pub observation_state: AccountLoader<'info, ObservationState>,
+    /// CHECK: Raydium CLMM ObservationState for the TWAP manipulation guard.
+    /// Validated in the handler: owner == Raydium CLMM program and its pool_id
+    /// == vault.pool_id. Parsed as raw bytes (current 100-slot oracle layout).
+    pub observation_state: UncheckedAccount<'info>,
 
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
@@ -114,15 +114,17 @@ pub fn handler(ctx: Context<DepositToken0>, amount: u64, min_shares_out: u64) ->
     // If an attacker tries to sandwich this deposit, the deviation will be >>10%
     // and the transaction will revert before any shares are minted.
     {
-        let obs = ctx.accounts.observation_state.load()?;
+        let obs_ai = &ctx.accounts.observation_state;
+        require!(obs_ai.owner == &raydium_clmm_cpi::id(), VaultError::InvalidPriceFeed);
+        let obs_data = obs_ai.try_borrow_data()?;
         require!(
-            obs.pool_id == vault.pool_id,
+            observation_pool_id(&obs_data) == Some(vault.pool_id),
             VaultError::InvalidPriceFeed
         );
         // Require an oracle reference once the vault holds funds (audit H3).
         check_price_not_manipulated(
             sqrt_price_x64,
-            &obs,
+            &obs_data,
             vault.total_shares > 0,
             MAX_SQRT_DEVIATION_BPS,
         )?;

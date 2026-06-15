@@ -7,12 +7,12 @@ use anchor_spl::token_interface::{
 };
 use raydium_clmm_cpi::{
     cpi,
-    states::{ObservationState, PoolState, PersonalPositionState, TickArrayState},
+    states::{PoolState, PersonalPositionState, TickArrayState},
 };
 
 use crate::errors::VaultError;
 use crate::events::WithdrawEvent;
-use crate::state::{check_price_not_manipulated, seeds, value_in_token1, UserDeposit, Vault, MAX_SQRT_DEVIATION_WITHDRAW_BPS};
+use crate::state::{check_price_not_manipulated, observation_pool_id, seeds, value_in_token1, UserDeposit, Vault, MAX_SQRT_DEVIATION_WITHDRAW_BPS};
 
 #[derive(Accounts)]
 pub struct WithdrawFromPosition<'info> {
@@ -83,9 +83,9 @@ pub struct WithdrawFromPosition<'info> {
     )]
     pub pool_state: AccountLoader<'info, PoolState>,
 
-    /// Raydium CLMM ObservationState for the TWAP price-manipulation check (audit H2).
-    /// Must belong to the same pool as vault.pool_id.
-    pub observation_state: AccountLoader<'info, ObservationState>,
+    /// CHECK: Raydium CLMM ObservationState for the TWAP manipulation guard
+    /// (audit H2). Validated in the handler (owner + pool_id); parsed as raw bytes.
+    pub observation_state: UncheckedAccount<'info>,
 
     #[account(
         constraint = position_nft_account.amount == 1,
@@ -141,11 +141,16 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     // guard: spot must be within MAX_SQRT_DEVIATION_BPS of the ≥30s observation.
     {
         let sqrt_price_x64 = ctx.accounts.pool_state.load()?.sqrt_price_x64;
-        let obs = ctx.accounts.observation_state.load()?;
-        require!(obs.pool_id == ctx.accounts.vault.pool_id, VaultError::InvalidPriceFeed);
+        let obs_ai = &ctx.accounts.observation_state;
+        require!(obs_ai.owner == &raydium_clmm_cpi::id(), VaultError::InvalidPriceFeed);
+        let obs_data = obs_ai.try_borrow_data()?;
+        require!(
+            observation_pool_id(&obs_data) == Some(ctx.accounts.vault.pool_id),
+            VaultError::InvalidPriceFeed
+        );
         // Active position always implies funds → always require an oracle reference.
         // Softer band on withdraw (audit M-2): volatility must never lock a user out.
-        check_price_not_manipulated(sqrt_price_x64, &obs, true, MAX_SQRT_DEVIATION_WITHDRAW_BPS)?;
+        check_price_not_manipulated(sqrt_price_x64, &obs_data, true, MAX_SQRT_DEVIATION_WITHDRAW_BPS)?;
     }
 
     // Use actual share token balance (audit finding #2 fix). The caller always

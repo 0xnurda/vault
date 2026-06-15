@@ -5,7 +5,7 @@ use anchor_spl::token_2022::Token2022;
 use anchor_spl::token_interface::{Mint, TokenAccount};
 use raydium_clmm_cpi::{
     cpi,
-    states::{AmmConfig, ObservationState, PoolState},
+    states::{AmmConfig, PoolState},
 };
 
 use crate::errors::VaultError;
@@ -67,8 +67,11 @@ pub struct SwapInTreasury<'info> {
     #[account(mut)]
     pub output_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
+    /// CHECK: Raydium CLMM ObservationState. Bound to the pool in the handler via
+    /// `pool.observation_key == observation_state.key()` (C-1); the swap CPI writes
+    /// to it. Read as raw bytes for the TWAP floor (current 100-slot oracle layout).
     #[account(mut)]
-    pub observation_state: AccountLoader<'info, ObservationState>,
+    pub observation_state: UncheckedAccount<'info>,
 
     pub input_vault_mint: Box<InterfaceAccount<'info, Mint>>,
     pub output_vault_mint: Box<InterfaceAccount<'info, Mint>>,
@@ -129,11 +132,13 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     // treasury via repeated near-floor self-sandwich swaps.
     let (new_window_start, new_window_volume) = {
         let now = Clock::get()?.unix_timestamp;
-        let obs = ctx.accounts.observation_state.load()?;
         // Fail-safe: a vault holding real funds must NOT swap without an oracle
         // reference. We are swapping treasury funds here, so require history.
-        let ref_sqrt = reference_sqrt_price(&obs, now)
-            .ok_or(error!(VaultError::OracleUnavailable))?;
+        // (Borrow is scoped to this block and released before the swap CPI.)
+        let ref_sqrt = {
+            let obs_data = ctx.accounts.observation_state.try_borrow_data()?;
+            reference_sqrt_price(&obs_data).ok_or(error!(VaultError::OracleUnavailable))?
+        };
 
         // Direction from the validated `direction` + vault mints (audit [D]).
         let pool = ctx.accounts.pool_state.load()?;

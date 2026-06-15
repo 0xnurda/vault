@@ -3,7 +3,6 @@ use crate::constants::{
     DEAD_SHARES, MAX_POSITION_WIDTH_SPACINGS, MIN_POSITION_SIDE_PCT, MIN_POSITION_WIDTH_SPACINGS,
 };
 use crate::errors::VaultError;
-use raydium_clmm_cpi::states::{ObservationState, OBSERVATION_NUM};
 
 // Fixed-width integers for bit-exact CLMM math. Isolated in their own module so
 // the construct_uint! macro doesn't collide with anchor_lang's prelude Result/`?`.
@@ -538,36 +537,61 @@ pub const MAX_SQRT_DEVIATION_WITHDRAW_BPS: u128 = 500;
 /// Minimum age of the reference observation to be meaningful.
 const TWAP_MIN_AGE_SECS: u32 = 30;
 
-/// Verify the current pool sqrt_price_x64 (spot) has not been manipulated
-/// by a flash-loan sandwich attack.
+// ─── Raydium CLMM ObservationState (CURRENT on-chain layout) ──────────────────
+//
+// Raydium replaced the old 1000-slot oracle (which stored per-slot
+// sqrt_price_x64) with a compact 100-slot cumulative-tick oracle. Both mainnet
+// (CAMMCzo…) and devnet (DRay…) pools now use THIS layout (account = 4483 bytes),
+// while the raydium-clmm-cpi crate still ships the old struct — so we parse the
+// account bytes directly instead of zero-copy-loading the crate type.
+//
+// Account data (8-byte anchor discriminator first), all little-endian:
+//   8   discriminator
+//   +0  initialized: bool (1)
+//   +1  recent_epoch: u64 (8)
+//   +9  observation_index: u16 (2)
+//   +11 pool_id: Pubkey (32)
+//   +43 observations: [Observation; 100]
+//   Observation = block_timestamp: u32 (4) | tick_cumulative: i64 (8) | padding (32) = 44
+const OBS_DISCRIMINATOR: usize = 8;
+const OBS_INITIALIZED_OFFSET: usize = OBS_DISCRIMINATOR;            // 8
+const OBS_POOL_ID_OFFSET: usize = OBS_DISCRIMINATOR + 1 + 8 + 2;    // 19
+const OBS_OBSERVATIONS_OFFSET: usize = OBS_POOL_ID_OFFSET + 32;     // 51
+const OBS_ENTRY_LEN: usize = 44;
+const OBS_NUM: usize = 100;
+
+/// Valid tick bounds for Raydium CLMM (= Uniswap v3 bounds).
+pub const MIN_TICK: i32 = -443636;
+pub const MAX_TICK: i32 = 443636;
+
+/// Read `pool_id` from a raw ObservationState account.
+pub fn observation_pool_id(obs_data: &[u8]) -> Option<Pubkey> {
+    let bytes: [u8; 32] = obs_data
+        .get(OBS_POOL_ID_OFFSET..OBS_POOL_ID_OFFSET + 32)?
+        .try_into()
+        .ok()?;
+    Some(Pubkey::new_from_array(bytes))
+}
+
+/// Verify the current pool sqrt_price_x64 (spot) has not been manipulated by a
+/// flash-loan sandwich, using Raydium's cumulative-tick TWAP oracle.
 ///
-/// Compares the live pool price with a stored Raydium observation from
-/// ≥ 30 seconds ago. Each ObservationState slot stores the pool's
-/// sqrt_price_x64 just before the most recent swap in that slot — so
-/// a same-block flash manipulation is detected immediately.
+/// A ≥30 s time-weighted-average tick is derived from two observations'
+/// `tick_cumulative` checkpoints, converted to a sqrt price via the bit-exact
+/// tick table, and compared with spot. A same-tx manipulation moves spot a lot
+/// but barely moves the long-window TWAP, so it is detected.
 ///
-/// When `require_reference` is true (the vault already holds funds), a missing
-/// ≥30 s observation is FAIL-SAFE: revert instead of skipping (audit H3). When
-/// false (e.g. the very first deposit into an empty vault) a missing reference
-/// is allowed — there is nothing to manipulate yet and dead-shares cover it.
-///
-/// Raydium ObservationState layout (anchor-0.31.1):
-///   initialized: bool, pool_id: Pubkey,
-///   observations: [Observation; OBSERVATION_NUM=1000], padding
-/// Observation: block_timestamp: u32, sqrt_price_x64: u128, cumulative_time_price_x64: u128, padding: u128
+/// When `require_reference` is true (vault holds funds), a missing ≥30 s window
+/// is FAIL-SAFE: revert (audit H3). When false (first deposit into an empty
+/// vault) a missing reference is allowed — nothing to manipulate yet.
 pub fn check_price_not_manipulated(
     sqrt_price_x64: u128,
-    obs_state: &ObservationState,
+    obs_data: &[u8],
     require_reference: bool,
     max_deviation_bps: u128,
 ) -> Result<()> {
-    // Single source of truth + single pass over the buffer (audit L-3).
-    let now = Clock::get()?.unix_timestamp;
-    let ref_sqrt = match reference_sqrt_price(obs_state, now) {
+    let ref_sqrt = match reference_sqrt_price(obs_data) {
         Some(s) => s,
-        // No usable ≥30 s reference. Fail-safe when the vault holds funds
-        // (audit H3); allow otherwise (e.g. first deposit into an empty vault —
-        // nothing to manipulate yet and dead-shares cover it).
         None => {
             require!(!require_reference, VaultError::OracleUnavailable);
             return Ok(());
@@ -616,28 +640,67 @@ pub const MAX_SWAP_VOLUME_BPS: u128 = 10_000;
 /// cap in one block, spreading any drain over time so the admin can react.
 pub const SWAP_COOLDOWN_SECS: i64 = 60;
 
-/// Return the most-recent Raydium observation sqrt_price that is ≥ TWAP_MIN_AGE_SECS
-/// old relative to `now` (wall-clock unix seconds). A same-tx sandwich cannot move
-/// a stored historical observation, so this is a manipulation-resistant reference.
-/// Single pass over the circular buffer (audit L-3). Returns None when the pool
-/// has no usable observation old enough.
-pub fn reference_sqrt_price(obs_state: &ObservationState, now: i64) -> Option<u128> {
-    if !obs_state.initialized {
+/// Manipulation-resistant reference sqrt_price (Q64.64) from Raydium's
+/// cumulative-tick oracle: the time-weighted average tick over a ≥30 s window
+/// ending at the newest observation, converted to sqrt price.
+///
+/// A flash manipulation in the current block updates only the newest checkpoint
+/// for a tiny dt, so its weight in a ≥30 s window is negligible — the TWAP stays
+/// close to the honest price while spot moves. Returns None when the buffer has
+/// no two observations spanning ≥30 s (caller decides fail-safe vs allow).
+///
+/// Reads one `Observation` per slot from the raw account (block_timestamp: u32,
+/// tick_cumulative: i64). Two passes over 100 slots — cheap.
+pub fn reference_sqrt_price(obs_data: &[u8]) -> Option<u128> {
+    if *obs_data.get(OBS_INITIALIZED_OFFSET)? == 0 {
         return None;
     }
-    let mut best_ref_ts = 0u32;
-    let mut ref_sqrt: Option<u128> = None;
-    for obs in obs_state.observations[..OBSERVATION_NUM].iter() {
-        if obs.block_timestamp == 0 || obs.sqrt_price_x64 == 0 {
-            continue;
+    let read = |i: usize| -> Option<(i64, i64)> {
+        let base = OBS_OBSERVATIONS_OFFSET + i * OBS_ENTRY_LEN;
+        let ts = u32::from_le_bytes(obs_data.get(base..base + 4)?.try_into().ok()?) as i64;
+        if ts == 0 {
+            return None; // empty slot
         }
-        let age = now.saturating_sub(obs.block_timestamp as i64);
-        if age >= TWAP_MIN_AGE_SECS as i64 && obs.block_timestamp > best_ref_ts {
-            best_ref_ts = obs.block_timestamp;
-            ref_sqrt = Some(obs.sqrt_price_x64);
+        let cum = i64::from_le_bytes(obs_data.get(base + 4..base + 12)?.try_into().ok()?);
+        Some((ts, cum))
+    };
+
+    // Pass 1: newest checkpoint (max block_timestamp).
+    let mut newest_ts = 0i64;
+    let mut newest_cum = 0i64;
+    for i in 0..OBS_NUM {
+        if let Some((ts, cum)) = read(i) {
+            if ts > newest_ts {
+                newest_ts = ts;
+                newest_cum = cum;
+            }
         }
     }
-    ref_sqrt.filter(|s| *s > 0)
+    if newest_ts == 0 {
+        return None;
+    }
+
+    // Pass 2: the most recent checkpoint that is ≥30 s BEFORE the newest one.
+    // (Relative to newest, not wall-clock, so a quiet pool still yields a window.)
+    let mut old_ts = 0i64;
+    let mut old_cum = 0i64;
+    for i in 0..OBS_NUM {
+        if let Some((ts, cum)) = read(i) {
+            if newest_ts - ts >= TWAP_MIN_AGE_SECS as i64 && ts > old_ts {
+                old_ts = ts;
+                old_cum = cum;
+            }
+        }
+    }
+    if old_ts == 0 || newest_ts <= old_ts {
+        return None; // no ≥30 s window available
+    }
+
+    // Time-weighted average tick over [old, newest], then → sqrt price.
+    let dt = newest_ts - old_ts;
+    let avg_tick = (newest_cum - old_cum) / dt;
+    let tick = avg_tick.clamp(MIN_TICK as i64, MAX_TICK as i64) as i32;
+    Some(get_sqrt_price_at_tick(tick))
 }
 
 /// Compute the minimum acceptable swap output (raw units) from a reference
