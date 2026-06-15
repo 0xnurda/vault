@@ -128,10 +128,11 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     // cumulative swap volume per window, so a compromised operator cannot bleed the
     // treasury via repeated near-floor self-sandwich swaps.
     let (new_window_start, new_window_volume) = {
+        let now = Clock::get()?.unix_timestamp;
         let obs = ctx.accounts.observation_state.load()?;
         // Fail-safe: a vault holding real funds must NOT swap without an oracle
         // reference. We are swapping treasury funds here, so require history.
-        let ref_sqrt = reference_sqrt_price(&obs)
+        let ref_sqrt = reference_sqrt_price(&obs, now)
             .ok_or(error!(VaultError::OracleUnavailable))?;
 
         // Direction from the validated `direction` + vault mints (audit [D]).
@@ -166,8 +167,6 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
             .checked_mul(MAX_SWAP_VOLUME_BPS)
             .and_then(|v| v.checked_div(10_000))
             .unwrap_or(0);
-
-        let now = Clock::get()?.unix_timestamp;
 
         // 3) Cooldown between swaps (audit M-3). last_swap_at == 0 (never swapped)
         // passes naturally since now - 0 is far larger than the cooldown.

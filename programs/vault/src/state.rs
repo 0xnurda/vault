@@ -239,11 +239,18 @@ impl Vault {
         if self.total_shares <= DEAD_SHARES || current_tvl == 0 {
             return Ok(deposit_value);
         }
-        (deposit_value as u128)
+        let proportional = (deposit_value as u128)
             .checked_mul(self.total_shares as u128)
-            .and_then(|v| v.checked_div(current_tvl as u128))
-            .and_then(|v| u64::try_from(v).ok())
-            .ok_or(error!(VaultError::MathOverflow))
+            .and_then(|v| v.checked_div(current_tvl as u128));
+        match proportional {
+            Some(v) if v <= u64::MAX as u128 => Ok(v as u64),
+            // Edge (audit L-2): the vault collapsed to dust TVL while shares
+            // remain (e.g. DEAD_SHARES + a tiny stuck holder), so the
+            // proportional mint exceeds u64 and would revert every deposit.
+            // The dust holders are economically negligible — fall back to
+            // fresh-start pricing instead of locking the vault out of deposits.
+            _ => Ok(deposit_value),
+        }
     }
 
     /// token1 value of given shares given current TVL.
@@ -554,48 +561,17 @@ pub fn check_price_not_manipulated(
     require_reference: bool,
     max_deviation_bps: u128,
 ) -> Result<()> {
-    // No usable history. Fail-safe when the vault holds funds; allow otherwise.
-    let no_history_result = || -> Result<()> {
-        require!(!require_reference, VaultError::OracleUnavailable);
-        Ok(())
-    };
-
-    if !obs_state.initialized {
-        return no_history_result();
-    }
-
-    // Find the latest observation timestamp across all slots.
-    // (ObservationState has no index field — observations are circular.)
-    let mut latest_ts = 0u32;
-    for obs in obs_state.observations[..OBSERVATION_NUM].iter() {
-        if obs.block_timestamp > latest_ts {
-            latest_ts = obs.block_timestamp;
+    // Single source of truth + single pass over the buffer (audit L-3).
+    let now = Clock::get()?.unix_timestamp;
+    let ref_sqrt = match reference_sqrt_price(obs_state, now) {
+        Some(s) => s,
+        // No usable ≥30 s reference. Fail-safe when the vault holds funds
+        // (audit H3); allow otherwise (e.g. first deposit into an empty vault —
+        // nothing to manipulate yet and dead-shares cover it).
+        None => {
+            require!(!require_reference, VaultError::OracleUnavailable);
+            return Ok(());
         }
-    }
-    if latest_ts == 0 {
-        return no_history_result();
-    }
-
-    // Find the most-recent observation that is at least TWAP_MIN_AGE_SECS old.
-    // This is our reference — the pool price before any potential manipulation.
-    let mut ref_sqrt: Option<u128> = None;
-    let mut best_ref_ts = 0u32;
-
-    for obs in obs_state.observations[..OBSERVATION_NUM].iter() {
-        if obs.block_timestamp == 0 || obs.sqrt_price_x64 == 0 {
-            continue;
-        }
-        let age = latest_ts.saturating_sub(obs.block_timestamp);
-        if age >= TWAP_MIN_AGE_SECS && obs.block_timestamp > best_ref_ts {
-            best_ref_ts = obs.block_timestamp;
-            ref_sqrt = Some(obs.sqrt_price_x64);
-        }
-    }
-
-    // Insufficient history → fail-safe if vault holds funds, else allow.
-    let ref_sqrt = match ref_sqrt {
-        Some(s) if s > 0 => s,
-        _ => return no_history_result(),
     };
 
     // Both values are Q64.64 — same format, direct comparison is valid.
@@ -640,31 +616,23 @@ pub const MAX_SWAP_VOLUME_BPS: u128 = 10_000;
 /// cap in one block, spreading any drain over time so the admin can react.
 pub const SWAP_COOLDOWN_SECS: i64 = 60;
 
-/// Return the most-recent Raydium observation sqrt_price that is ≥30 s old.
-/// This is a manipulation-resistant reference price (a same-tx sandwich
-/// cannot move a stored historical observation). Returns None when the pool
-/// has insufficient history.
-pub fn reference_sqrt_price(obs_state: &ObservationState) -> Option<u128> {
+/// Return the most-recent Raydium observation sqrt_price that is ≥ TWAP_MIN_AGE_SECS
+/// old relative to `now` (wall-clock unix seconds). A same-tx sandwich cannot move
+/// a stored historical observation, so this is a manipulation-resistant reference.
+/// Single pass over the circular buffer (audit L-3). Returns None when the pool
+/// has no usable observation old enough.
+pub fn reference_sqrt_price(obs_state: &ObservationState, now: i64) -> Option<u128> {
     if !obs_state.initialized {
         return None;
     }
-    let mut latest_ts = 0u32;
-    for obs in obs_state.observations[..OBSERVATION_NUM].iter() {
-        if obs.block_timestamp > latest_ts {
-            latest_ts = obs.block_timestamp;
-        }
-    }
-    if latest_ts == 0 {
-        return None;
-    }
-    let mut ref_sqrt: Option<u128> = None;
     let mut best_ref_ts = 0u32;
+    let mut ref_sqrt: Option<u128> = None;
     for obs in obs_state.observations[..OBSERVATION_NUM].iter() {
         if obs.block_timestamp == 0 || obs.sqrt_price_x64 == 0 {
             continue;
         }
-        let age = latest_ts.saturating_sub(obs.block_timestamp);
-        if age >= TWAP_MIN_AGE_SECS && obs.block_timestamp > best_ref_ts {
+        let age = now.saturating_sub(obs.block_timestamp as i64);
+        if age >= TWAP_MIN_AGE_SECS as i64 && obs.block_timestamp > best_ref_ts {
             best_ref_ts = obs.block_timestamp;
             ref_sqrt = Some(obs.sqrt_price_x64);
         }
@@ -886,5 +854,50 @@ mod math_tests {
         // 250 bps of 10_000_000 = 250_000 absolute sqrt deviation allowed.
         assert!(sqrt_within_deviation(reference + 250_000, reference, MAX_SQRT_DEVIATION_BPS));
         assert!(!sqrt_within_deviation(reference + 250_001, reference, MAX_SQRT_DEVIATION_BPS));
+    }
+
+    #[test]
+    fn sqrt_price_to_price_both_branches() {
+        // Q64.64 of 1.0 → pool price P = 1. With 6 decimals, 1 token0 = 1e6 token1.
+        let one = 1u128 << 64;
+        assert_eq!(sqrt_price_to_price(one, true, 6, 6), Some(1_000_000));
+        // Inverted pool at P=1 is still 1.
+        assert_eq!(sqrt_price_to_price(one, false, 6, 6), Some(1_000_000));
+
+        // sqrt_price for pool price P = 4 → sqrt = 2 (Q64.64 = 2 * 2^64).
+        let sqrt_p4 = 2u128 << 64;
+        // Non-inverted: 1 token0 = 4 token1 → 4e6 at 6 decimals.
+        assert_eq!(sqrt_price_to_price(sqrt_p4, true, 6, 6), Some(4_000_000));
+        // Inverted: price flips to 1/4 → 0.25 = 250_000 at 6 decimals.
+        assert_eq!(sqrt_price_to_price(sqrt_p4, false, 6, 6), Some(250_000));
+    }
+
+    #[test]
+    fn sqrt_price_to_price_inverted_is_reciprocal() {
+        // non_inverted × inverted ≈ scale^2 (10^6 × 10^6 = 10^12) within rounding.
+        let sqrt_p4 = 2u128 << 64;
+        let direct = sqrt_price_to_price(sqrt_p4, true, 6, 6).unwrap() as u128;
+        let inverted = sqrt_price_to_price(sqrt_p4, false, 6, 6).unwrap() as u128;
+        assert_eq!(direct * inverted, 1_000_000_000_000);
+    }
+
+    #[test]
+    fn sqrt_price_to_price_zero_sqrt_is_none() {
+        // sqrt so small that the >>32 intermediate is 0 → None, never a divide-by-zero.
+        assert_eq!(sqrt_price_to_price(1, true, 6, 6), None);
+        assert_eq!(sqrt_price_to_price(1, false, 6, 6), None);
+    }
+
+    #[test]
+    fn shares_mint_dust_tvl_does_not_overflow() {
+        // L-2: DEAD_SHARES + a tiny stuck holder, TVL collapsed to dust. A large
+        // deposit must NOT revert — it falls back to fresh-start pricing.
+        let mut v = Vault::default();
+        v.total_shares = DEAD_SHARES + 5; // just above the dead-shares floor
+        let dust_tvl = 1u64;              // ~zero value left in the vault
+        let shares = v
+            .calculate_shares_to_mint(u64::MAX, dust_tvl)
+            .expect("must not revert");
+        assert_eq!(shares, u64::MAX); // fresh-start fallback
     }
 }

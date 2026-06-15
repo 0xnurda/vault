@@ -111,16 +111,18 @@ pub fn handler(ctx: Context<Withdraw>, min_token0_out: u64, min_token1_out: u64)
     let total_shares = vault.total_shares;
     require!(total_shares > 0, VaultError::InsufficientShares);
 
-    // Total user-accessible funds = treasury + position - protocol fees
+    // Total user-accessible funds = treasury - protocol fees.
+    // This path is reachable only when there is NO active position (guard above),
+    // so all funds are in the treasury; adding vault.position_token0/1 here would
+    // be a dead term at best and a double-count of already-closed funds at worst
+    // (audit L-7).
     let total_user_token0 = vault
         .treasury_token0
-        .saturating_sub(vault.accumulated_protocol_fees_token0)
-        .saturating_add(vault.position_token0);
+        .saturating_sub(vault.accumulated_protocol_fees_token0);
 
     let total_user_token1 = vault
         .treasury_token1
-        .saturating_sub(vault.accumulated_protocol_fees_token1)
-        .saturating_add(vault.position_token1);
+        .saturating_sub(vault.accumulated_protocol_fees_token1);
 
     // User's proportional entitlement
     let token0_to_withdraw = (total_user_token0 as u128)

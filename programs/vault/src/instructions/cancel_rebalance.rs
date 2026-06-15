@@ -23,7 +23,9 @@ pub struct CancelRebalance<'info> {
         mut,
         seeds = [seeds::VAULT, vault.pool_id.as_ref()],
         bump = vault.bump,
-        constraint = vault.is_operator(&admin.key()) @ VaultError::Unauthorized,
+        // Admin-only (audit L-6): an emergency instruction that unblocks
+        // deposits/withdrawals should not be reachable by the hot operator key.
+        constraint = vault.admin == admin.key() @ VaultError::Unauthorized,
         constraint = vault.is_rebalancing @ VaultError::NotRebalancing,
     )]
     pub vault: Box<Account<'info, Vault>>,
