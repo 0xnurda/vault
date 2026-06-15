@@ -23,11 +23,21 @@ pub struct ExtractRewards<'info> {
     )]
     pub vault: Box<Account<'info, Vault>>,
 
-    /// The reward token mint. Must NOT be either pool token — that would let this
-    /// path drain principal/fees rather than rewards.
+    /// The reward token mint. Must NOT be any vault-controlled mint, so this path
+    /// can only ever move genuine reward tokens — never principal, fees, the
+    /// position NFT, or share tokens:
+    ///   - token0/token1: excluding them prevents draining the treasury.
+    ///   - position_mint: the position NFT lives on a vault-owned account; without
+    ///     this exclusion an admin could sweep the NFT to the protocol wallet,
+    ///     close the Raydium position directly and steal all user principal. This
+    ///     is currently also blocked by the legacy-SPL vs Token-2022 type
+    ///     mismatch, but that is incidental — make it explicit (audit follow-up).
+    ///   - share_mint: never a reward; excluded for completeness.
     #[account(
         constraint = reward_mint.key() != vault.token0_mint @ VaultError::InvalidMint,
         constraint = reward_mint.key() != vault.token1_mint @ VaultError::InvalidMint,
+        constraint = reward_mint.key() != vault.position_mint @ VaultError::InvalidMint,
+        constraint = reward_mint.key() != vault.share_mint @ VaultError::InvalidMint,
     )]
     pub reward_mint: Box<Account<'info, Mint>>,
 
