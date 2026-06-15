@@ -53,6 +53,11 @@ pub mod vault {
         instructions::extract_protocol_fee::handler(ctx)
     }
 
+    /// Sweep claimed LM reward tokens to protocol_wallet (audit M-4).
+    pub fn extract_rewards(ctx: Context<ExtractRewards>) -> Result<()> {
+        instructions::extract_rewards::handler(ctx)
+    }
+
     /// Emergency: cancel a stuck rebalance (if open_position fails after close_position).
     pub fn cancel_rebalance(ctx: Context<CancelRebalance>) -> Result<()> {
         instructions::cancel_rebalance::handler(ctx)

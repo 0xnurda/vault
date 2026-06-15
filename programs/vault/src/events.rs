@@ -94,6 +94,13 @@ pub struct ProtocolFeeExtracted {
 }
 
 #[event]
+pub struct RewardsExtracted {
+    pub reward_mint: Pubkey,
+    pub amount: u64,
+    pub protocol_wallet: Pubkey,
+}
+
+#[event]
 pub struct VaultPausedEvent {
     pub paused: bool,
 }

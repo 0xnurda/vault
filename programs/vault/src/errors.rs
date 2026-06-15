@@ -79,4 +79,7 @@ pub enum VaultError {
 
     #[msg("Swap cooldown active: too soon since the last treasury swap")]
     SwapCooldownActive,
+
+    #[msg("No reward tokens available to extract")]
+    NoRewardsToExtract,
 }
