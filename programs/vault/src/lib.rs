@@ -180,8 +180,7 @@ pub mod vault {
         ctx: Context<'a, 'b, 'c, 'info, WithdrawFromPosition<'info>>,
         min_token0_out: u64,
         min_token1_out: u64,
-        shares_to_withdraw: u64,
     ) -> Result<()> {
-        instructions::withdraw_from_position::handler(ctx, min_token0_out, min_token1_out, shares_to_withdraw)
+        instructions::withdraw_from_position::handler(ctx, min_token0_out, min_token1_out)
     }
 }

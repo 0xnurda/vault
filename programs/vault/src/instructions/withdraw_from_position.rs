@@ -128,7 +128,6 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     ctx: Context<'a, 'b, 'c, 'info, WithdrawFromPosition<'info>>,
     min_token0_out: u64,
     min_token1_out: u64,
-    shares_to_withdraw: u64,
 ) -> Result<()> {
     let remaining = ctx.remaining_accounts.to_vec();
 
@@ -149,17 +148,10 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
         check_price_not_manipulated(sqrt_price_x64, &obs, true, MAX_SQRT_DEVIATION_WITHDRAW_BPS)?;
     }
 
-    // Use actual share token balance (audit finding #2 fix). `shares_to_withdraw`
-    // == 0 means redeem the FULL balance; otherwise redeem exactly that many
-    // (must not exceed the balance) — enables partial withdrawals.
-    let available_shares = ctx.accounts.user_share_account.amount;
-    require!(available_shares > 0, VaultError::InsufficientShares);
-    let shares_amount = if shares_to_withdraw == 0 {
-        available_shares
-    } else {
-        require!(shares_to_withdraw <= available_shares, VaultError::InsufficientShares);
-        shares_to_withdraw
-    };
+    // Use actual share token balance (audit finding #2 fix). The caller always
+    // redeems their FULL share balance.
+    let shares_amount = ctx.accounts.user_share_account.amount;
+    require!(shares_amount > 0, VaultError::InsufficientShares);
 
     let total_shares = ctx.accounts.vault.total_shares;
     require!(total_shares > 0, VaultError::InsufficientShares);
