@@ -295,6 +295,16 @@ impl Vault {
 }
 
 // ─── Raydium CLMM pool price helpers ───────────────────────────────────────
+//
+// These offsets (and the AccountLoader<PoolState> reads elsewhere) were verified
+// against LIVE pool accounts on 2026-06-15: the on-chain PoolState is 1544 bytes
+// on BOTH mainnet (CAMMCzo… pool 3ucNos…) and devnet (DRay… pool 9Pkg…), which
+// equals raydium-clmm-cpi's PoolState::LEN exactly — byte-for-byte, with these
+// fields at the offsets below. The `dynamic_fee_info` added in raydium-clmm
+// `main` is NOT in the deployed programs, so there is no layout drift and no
+// change is needed here. (Contrast ObservationState, which Raydium shrank to a
+// 100-slot cumulative-tick layout — that one we had to re-parse from raw bytes.)
+// The crate rev is pinned in Cargo.toml so this layout can't shift unnoticed.
 
 /// Byte offset of `token_mint_0` in a Raydium CLMM PoolState account.
 const POOL_TOKEN_MINT_0_OFFSET: usize = 73;

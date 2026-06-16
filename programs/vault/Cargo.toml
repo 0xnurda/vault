@@ -25,8 +25,17 @@ devnet = ["raydium-clmm-cpi/devnet"]
 anchor-lang = { version = "0.31.1", features = ["init-if-needed"] }
 anchor-spl = "0.31.1"
 
-# Raydium CLMM CPI for swaps (branch for anchor 0.31.1)
-raydium-clmm-cpi = { git = "https://github.com/raydium-io/raydium-cpi", branch = "anchor-0.31.1", package = "raydium-clmm-cpi" }
+# Raydium CLMM CPI (anchor 0.31.1). PINNED to an exact rev so the account layouts
+# we depend on can't silently shift if the branch moves (audit follow-up:
+# "запинить версию Raydium"). PoolState verified against LIVE accounts on
+# 2026-06-15: PoolState::LEN == 1544 bytes == the on-chain pool length on BOTH
+# mainnet (CAMMCzo… pool 3ucNos…) and devnet (DRay… pool 9Pkg…), byte-for-byte,
+# with the fields the vault reads at correct offsets. The `dynamic_fee_info` field
+# in raydium-clmm `main` is NOT in the deployed programs, so there is no drift —
+# no code change needed here (unlike ObservationState, which Raydium shrank and we
+# had to fix). The full devnet lifecycle (open/close/swap/deposit/withdraw) also
+# loaded PoolState cleanly.
+raydium-clmm-cpi = { git = "https://github.com/raydium-io/raydium-cpi", rev = "5aeec4b40b09c7f42e28a0f697132b76de872856", package = "raydium-clmm-cpi" }
 
 # Pin versions to avoid incompatibility with Solana platform-tools rustc 1.75
 blake3 = "=1.5.5"
