@@ -1,8 +1,8 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{Mint, TokenAccount};
 
-use crate::constants::RAYDIUM_CLMM_PROGRAM_ID;
 use crate::errors::VaultError;
+use crate::events::VaultMigrated;
 use crate::state::{seeds, Vault};
 
 /// One-time migration instruction to upgrade the vault account to the generic
@@ -71,9 +71,9 @@ pub struct MigrateVault<'info> {
     pub token1_mint: Account<'info, Mint>,
 
     /// The Raydium CLMM pool — validated to be owned by Raydium (audit #3).
-    /// CHECK: Ownership validated against RAYDIUM_CLMM_PROGRAM_ID.
+    /// CHECK: Ownership validated against the Raydium CLMM program (feature-switched).
     #[account(
-        constraint = pool_id_account.owner == &RAYDIUM_CLMM_PROGRAM_ID @ VaultError::InvalidPriceFeed,
+        constraint = pool_id_account.owner == &raydium_clmm_cpi::id() @ VaultError::InvalidPriceFeed,
     )]
     pub pool_id_account: AccountInfo<'info>,
 
@@ -160,7 +160,7 @@ pub fn handler(
             // The passed personal_position must be the real PDA for this position.
             let (expected_pda, _) = Pubkey::find_program_address(
                 &[b"position", position_mint.as_ref()],
-                &RAYDIUM_CLMM_PROGRAM_ID,
+                &raydium_clmm_cpi::id(),
             );
             require!(
                 ctx.accounts.personal_position.key() == expected_pda,
@@ -280,11 +280,14 @@ pub fn handler(
     // ── Step 6: Serialize and write back ──────────────────────────────────
     let struct_bytes = new_vault
         .try_to_vec()
-        .map_err(|_| error!(VaultError::MathOverflow))?;
+        .map_err(|_| error!(VaultError::SerializationError))?;
 
-    let mut data = ctx.accounts.vault.try_borrow_mut_data()?;
-    data[0..8].copy_from_slice(&discriminator);
-    data[8..8 + struct_bytes.len()].copy_from_slice(&struct_bytes);
+    let new_len = {
+        let mut data = ctx.accounts.vault.try_borrow_mut_data()?;
+        data[0..8].copy_from_slice(&discriminator);
+        data[8..8 + struct_bytes.len()].copy_from_slice(&struct_bytes);
+        data.len() as u64
+    };
 
     msg!(
         "✅ Vault migrated: admin={}, pool_id={}, shares={}, token0={}, token1={}",
@@ -294,6 +297,7 @@ pub fn handler(
         ctx.accounts.token0_treasury.amount,
         ctx.accounts.token1_treasury.amount,
     );
+    emit!(VaultMigrated { admin: ctx.accounts.admin.key(), new_len });
 
     Ok(())
 }

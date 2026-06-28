@@ -8,6 +8,7 @@ use raydium_clmm_cpi::{
     states::{PoolState, PersonalPositionState, TickArrayState},
 };
 
+use crate::constants::PROTOCOL_FEE_DENOMINATOR;
 use crate::errors::VaultError;
 use crate::events::FeesCollected;
 use crate::state::{seeds, Vault};
@@ -18,13 +19,13 @@ use crate::state::{seeds, Vault};
 #[derive(Accounts)]
 pub struct CollectFees<'info> {
     #[account(mut)]
-    pub admin: Signer<'info>,
+    pub operator: Signer<'info>,
 
     #[account(
         mut,
         seeds = [seeds::VAULT, vault.pool_id.as_ref()],
         bump = vault.bump,
-        constraint = vault.is_operator(&admin.key()) @ VaultError::Unauthorized,
+        constraint = vault.is_operator(&operator.key()) @ VaultError::Unauthorized,
         constraint = vault.has_active_position @ VaultError::NoActivePosition,
     )]
     pub vault: Box<Account<'info, Vault>>,
@@ -137,8 +138,8 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(ctx: Context<'a, 'b, 'c, 'info, Collect
     let total_token0_fees = ctx.accounts.token0_treasury.amount.saturating_sub(token0_before);
     let total_token1_fees = ctx.accounts.token1_treasury.amount.saturating_sub(token1_before);
 
-    let protocol_token0 = total_token0_fees / 10;
-    let protocol_token1 = total_token1_fees / 10;
+    let protocol_token0 = total_token0_fees / PROTOCOL_FEE_DENOMINATOR;
+    let protocol_token1 = total_token1_fees / PROTOCOL_FEE_DENOMINATOR;
 
     let vault = &mut ctx.accounts.vault;
 

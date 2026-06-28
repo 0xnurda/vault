@@ -8,6 +8,7 @@ use raydium_clmm_cpi::{
     states::{PoolState, PersonalPositionState, TickArrayState},
 };
 
+use crate::constants::PROTOCOL_FEE_DENOMINATOR;
 use crate::errors::VaultError;
 use crate::events::PositionClosed;
 use crate::state::{seeds, Vault};
@@ -15,13 +16,13 @@ use crate::state::{seeds, Vault};
 #[derive(Accounts)]
 pub struct ClosePosition<'info> {
     #[account(mut)]
-    pub admin: Signer<'info>,
+    pub operator: Signer<'info>,
 
     #[account(
         mut,
         seeds = [seeds::VAULT, vault.pool_id.as_ref()],
         bump = vault.bump,
-        constraint = vault.is_operator(&admin.key()) @ VaultError::Unauthorized,
+        constraint = vault.is_operator(&operator.key()) @ VaultError::Unauthorized,
         constraint = vault.has_active_position @ VaultError::NoActivePosition,
     )]
     pub vault: Box<Account<'info, Vault>>,
@@ -109,8 +110,8 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(ctx: Context<'a, 'b, 'c, 'info, ClosePo
     // them into treasury). We accrue 10% to the protocol here so the cut isn't
     // forfeited when close is called without a preceding collect_fees. No extra
     // CPI — just a field read + arithmetic (keeps the SBF stack within limits).
-    let protocol_fee_token0 = ctx.accounts.personal_position.token_fees_owed_0 / 10;
-    let protocol_fee_token1 = ctx.accounts.personal_position.token_fees_owed_1 / 10;
+    let protocol_fee_token0 = ctx.accounts.personal_position.token_fees_owed_0 / PROTOCOL_FEE_DENOMINATOR;
+    let protocol_fee_token1 = ctx.accounts.personal_position.token_fees_owed_1 / PROTOCOL_FEE_DENOMINATOR;
 
     let vault_seeds: &[&[&[u8]]] = &[&[seeds::VAULT, pool_id.as_ref(), &[vault.bump]]];
 

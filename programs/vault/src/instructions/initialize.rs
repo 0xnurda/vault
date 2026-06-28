@@ -2,6 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{Mint, Token, TokenAccount};
 use raydium_clmm_cpi::states::PoolState;
 
+use crate::constants::WSOL_MINT;
 use crate::errors::VaultError;
 use crate::events::VaultInitialized;
 use crate::state::{seeds, Vault};
@@ -77,8 +78,8 @@ pub fn handler(
     protocol_wallet: Pubkey,
 ) -> Result<()> {
     // ── Validate admin and protocol_wallet ───────────────────────────────────
-    require!(admin != Pubkey::default(), VaultError::Unauthorized);
-    require!(protocol_wallet != Pubkey::default(), VaultError::Unauthorized);
+    require!(admin != Pubkey::default(), VaultError::InvalidArgument);
+    require!(protocol_wallet != Pubkey::default(), VaultError::InvalidArgument);
 
     // ── Validate token mints against pool (typed access, audit #6) ───────────
     // AccountLoader validates ownership (Raydium CLMM) + discriminator automatically.
@@ -97,6 +98,13 @@ pub fn handler(
     require!(
         (token0_key == pool_mint_0 && token1_key == pool_mint_1)
             || (token0_key == pool_mint_1 && token1_key == pool_mint_0),
+        VaultError::InvalidMint
+    );
+
+    // ── Enforce SOL-pair scope on-chain (A4) ─────────────────────────────────
+    // The vault economics/oracle are designed for SOL pairs; require one leg be wSOL.
+    require!(
+        token0_key == WSOL_MINT || token1_key == WSOL_MINT,
         VaultError::InvalidMint
     );
 

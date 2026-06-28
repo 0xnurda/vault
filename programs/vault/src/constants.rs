@@ -1,21 +1,22 @@
 use anchor_lang::prelude::Pubkey;
 use anchor_lang::solana_program::pubkey;
 
-/// Raydium CLMM program ID (mainnet and devnet share the same program).
-pub const RAYDIUM_CLMM_PROGRAM_ID: Pubkey =
-    pubkey!("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK");
-
 /// Wrapped SOL (wSOL) mint address.
 pub const WSOL_MINT: Pubkey =
     pubkey!("So11111111111111111111111111111111111111112");
 
-/// Minimum token0 deposit (anti-dust, prevents rounding to 0 shares).
-/// token0 = wSOL (9 decimals) → 1_000_000 lamports = 0.001 SOL (audit L4).
-pub const MIN_DEPOSIT_TOKEN0: u64 = 1_000_000; // 0.001 SOL
+/// Protocol fee = 1/PROTOCOL_FEE_DENOMINATOR of collected trading fees (10%).
+/// The remaining 90% stays in treasury for depositors. Single source of truth —
+/// used by collect_fees / close_position / decrease_liquidity / withdraw_from_position.
+pub const PROTOCOL_FEE_DENOMINATOR: u64 = 10;
 
-/// Minimum token1 deposit (anti-dust).
-/// token1 = USDC (6 decimals) → 1_000 micro = 0.001 USDC.
-pub const MIN_DEPOSIT_TOKEN1: u64 = 1_000; // 0.001 USDC
+/// Minimum token1-denominated value (≈ USDC) required for the FIRST deposit (A3).
+/// Prevents a tiny first deposit from eating a large share of its value to the
+/// DEAD_SHARES anti-inflation phantom shares: a depositor of value D loses
+/// D·DEAD_SHARES/(D+DEAD_SHARES). At D = MIN_FIRST_DEPOSIT_VALUE the loss is
+/// negligible (≈0.001). Per-token anti-dust minimums (derived from decimals in
+/// the deposit handlers) still apply on top of this.
+pub const MIN_FIRST_DEPOSIT_VALUE: u64 = 100_000; // ~0.1 USDC (token1 units)
 
 // ─── Position range guardrails (audit M3) ────────────────────────────────────
 // Bound the operator's open_position params so a compromised/malicious hot key

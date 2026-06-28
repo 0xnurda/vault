@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, MintTo, Token, TokenAccount, Transfer};
 use raydium_clmm_cpi::states::{PersonalPositionState, PoolState};
 
-use crate::constants::{DEAD_SHARES, MIN_DEPOSIT_TOKEN1};
+use crate::constants::{DEAD_SHARES, MIN_FIRST_DEPOSIT_VALUE};
 use crate::errors::VaultError;
 use crate::events::DepositToken1Event;
 use crate::state::{
@@ -81,11 +81,16 @@ pub struct DepositToken1<'info> {
 
 pub fn handler(ctx: Context<DepositToken1>, amount: u64, min_shares_out: u64) -> Result<()> {
     require!(amount > 0, VaultError::InvalidAmount);
-    require!(amount >= MIN_DEPOSIT_TOKEN1, VaultError::DepositTooSmall);
 
     let vault = &mut ctx.accounts.vault;
     let user_deposit = &mut ctx.accounts.user_deposit;
     let current_time = Clock::get()?.unix_timestamp;
+
+    // A4: anti-dust minimum derived from the token's decimals (~0.001 token).
+    // 6 decimals → 1_000 (matches the prior hardcoded MIN_DEPOSIT_TOKEN1),
+    // and generalizes to any SOL-pair quote token.
+    let min_deposit = 10u64.pow(vault.token1_decimals.saturating_sub(3) as u32);
+    require!(amount >= min_deposit, VaultError::DepositTooSmall);
 
     require!(!vault.is_paused, VaultError::VaultPaused);
     require!(!vault.is_rebalancing, VaultError::RebalancingInProgress);
@@ -158,6 +163,14 @@ pub fn handler(ctx: Context<DepositToken1>, amount: u64, min_shares_out: u64) ->
 
     // Shares to mint (audit #7: track first deposit for dead shares)
     let is_first_deposit = vault.total_shares == 0;
+    // A3: the first depositor pays the DEAD_SHARES anti-inflation cost; require a
+    // minimum token1-denominated value so that cost stays negligible.
+    if is_first_deposit {
+        require!(
+            deposit_value >= MIN_FIRST_DEPOSIT_VALUE,
+            VaultError::DepositTooSmall
+        );
+    }
     let shares_to_mint = vault.calculate_shares_to_mint(deposit_value, current_tvl)?;
     require!(shares_to_mint > 0, VaultError::InvalidAmount);
     // H-3: deposit slippage protection — caller's floor on minted shares.

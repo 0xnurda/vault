@@ -14,13 +14,13 @@ use crate::state::{seeds, Vault};
 #[derive(Accounts)]
 pub struct IncreaseLiquidity<'info> {
     #[account(mut)]
-    pub admin: Signer<'info>,
+    pub operator: Signer<'info>,
 
     #[account(
         mut,
         seeds = [seeds::VAULT, vault.pool_id.as_ref()],
         bump = vault.bump,
-        constraint = vault.is_operator(&admin.key()) @ VaultError::Unauthorized,
+        constraint = vault.is_operator(&operator.key()) @ VaultError::Unauthorized,
         constraint = vault.has_active_position @ VaultError::NoActivePosition,
     )]
     pub vault: Box<Account<'info, Vault>>,

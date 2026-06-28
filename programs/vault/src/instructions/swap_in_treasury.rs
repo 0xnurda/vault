@@ -27,13 +27,13 @@ pub enum SwapDirection {
 #[derive(Accounts)]
 pub struct SwapInTreasury<'info> {
     #[account(mut)]
-    pub admin: Signer<'info>,
+    pub operator: Signer<'info>,
 
     #[account(
         mut,
         seeds = [seeds::VAULT, vault.pool_id.as_ref()],
         bump = vault.bump,
-        constraint = vault.is_operator(&admin.key()) @ VaultError::Unauthorized,
+        constraint = vault.is_operator(&operator.key()) @ VaultError::Unauthorized,
     )]
     pub vault: Box<Account<'info, Vault>>,
 

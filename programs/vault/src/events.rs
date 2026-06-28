@@ -116,3 +116,20 @@ pub struct AdminTransferAccepted {
     pub old_admin: Pubkey,
     pub new_admin: Pubkey,
 }
+
+#[event]
+pub struct OperatorChanged {
+    pub old_operator: Pubkey,
+    pub new_operator: Pubkey,
+}
+
+#[event]
+pub struct RebalanceCancelled {
+    pub admin: Pubkey,
+}
+
+#[event]
+pub struct VaultMigrated {
+    pub admin: Pubkey,
+    pub new_len: u64,
+}

@@ -1,6 +1,7 @@
 use anchor_lang::prelude::*;
 
 use crate::errors::VaultError;
+use crate::events::RebalanceCancelled;
 use crate::state::{seeds, Vault};
 
 /// Emergency instruction: cancel a stuck rebalance.
@@ -40,6 +41,7 @@ pub fn handler(ctx: Context<CancelRebalance>) -> Result<()> {
         "Rebalance cancelled by admin {}. is_rebalancing = false.",
         ctx.accounts.admin.key()
     );
+    emit!(RebalanceCancelled { admin: ctx.accounts.admin.key() });
 
     Ok(())
 }

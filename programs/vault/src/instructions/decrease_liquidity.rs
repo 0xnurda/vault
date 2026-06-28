@@ -8,6 +8,7 @@ use raydium_clmm_cpi::{
     states::{PoolState, PersonalPositionState, TickArrayState},
 };
 
+use crate::constants::PROTOCOL_FEE_DENOMINATOR;
 use crate::errors::VaultError;
 use crate::events::LiquidityDecreased;
 use crate::state::{seeds, Vault};
@@ -15,13 +16,13 @@ use crate::state::{seeds, Vault};
 #[derive(Accounts)]
 pub struct DecreaseLiquidity<'info> {
     #[account(mut)]
-    pub admin: Signer<'info>,
+    pub operator: Signer<'info>,
 
     #[account(
         mut,
         seeds = [seeds::VAULT, vault.pool_id.as_ref()],
         bump = vault.bump,
-        constraint = vault.is_operator(&admin.key()) @ VaultError::Unauthorized,
+        constraint = vault.is_operator(&operator.key()) @ VaultError::Unauthorized,
         constraint = vault.has_active_position @ VaultError::NoActivePosition,
     )]
     pub vault: Box<Account<'info, Vault>>,
@@ -114,8 +115,8 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
 
     // M-1: capture owed fees before the decrease sweeps them into treasury, so the
     // protocol's 10% cut isn't forfeited. No extra CPI — field read + arithmetic.
-    let protocol_fee_token0 = ctx.accounts.personal_position.token_fees_owed_0 / 10;
-    let protocol_fee_token1 = ctx.accounts.personal_position.token_fees_owed_1 / 10;
+    let protocol_fee_token0 = ctx.accounts.personal_position.token_fees_owed_0 / PROTOCOL_FEE_DENOMINATOR;
+    let protocol_fee_token1 = ctx.accounts.personal_position.token_fees_owed_1 / PROTOCOL_FEE_DENOMINATOR;
 
     // ── Lean partial withdraw (Kamino-style): single CPI ─────────────────────
     // This removes the requested liquidity in ONE DecreaseLiquidityV2 CPI

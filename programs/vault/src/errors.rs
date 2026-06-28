@@ -62,7 +62,7 @@ pub enum VaultError {
     #[msg("Output below minimum: slippage tolerance exceeded")]
     SlippageExceeded,
 
-    #[msg("Price manipulation detected: spot price deviates from TWAP by more than 1.5%")]
+    #[msg("Price manipulation detected: spot price deviates from the TWAP beyond the allowed band")]
     PriceManipulationDetected,
 
     #[msg("Swap volume exceeds the per-window rate limit")]
@@ -82,4 +82,13 @@ pub enum VaultError {
 
     #[msg("No reward tokens available to extract")]
     NoRewardsToExtract,
+
+    #[msg("Invalid argument: pubkey cannot be the default (zero) address")]
+    InvalidArgument,
+
+    #[msg("Failed to serialize account data")]
+    SerializationError,
+
+    #[msg("A position is active — use withdraw_from_position instead")]
+    UseWithdrawFromPosition,
 }

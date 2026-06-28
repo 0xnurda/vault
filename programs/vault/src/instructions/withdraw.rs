@@ -91,16 +91,13 @@ pub fn handler(ctx: Context<Withdraw>, min_token0_out: u64, min_token1_out: u64)
     // draws from the treasury). Using this while a position is active allows
     // callers to claim an entitlement inflated by position_token0/token1 while
     // only drawing from treasury, leaving later withdrawers short.
-    require!(!vault.has_active_position, VaultError::PositionAlreadyExists);
+    require!(!vault.has_active_position, VaultError::UseWithdrawFromPosition);
 
-    // Emergency withdrawal: allow after 3600s of stuck rebalance
-    if vault.is_rebalancing {
-        let elapsed = current_time.saturating_sub(vault.rebalance_started_at);
-        require!(
-            vault.rebalance_started_at > 0 && elapsed >= 3600,
-            VaultError::RebalancingInProgress
-        );
-    }
+    // No active position (checked above) ⇒ all funds are in the treasury and
+    // pro-rata is always correct ⇒ withdrawal is always available, even during a
+    // rebalance. This removes the A1 operator freeze: previously a malicious
+    // operator could re-arm the rebalance timer each open/close cycle to block
+    // withdrawals indefinitely. There is no reason to gate this path.
 
     // Use actual share token balance — not the cached user_deposit.shares counter.
     // This allows shares to be freely transferred between wallets: whoever

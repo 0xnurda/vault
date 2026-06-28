@@ -10,6 +10,7 @@ use raydium_clmm_cpi::{
     states::{PoolState, PersonalPositionState, TickArrayState},
 };
 
+use crate::constants::PROTOCOL_FEE_DENOMINATOR;
 use crate::errors::VaultError;
 use crate::events::WithdrawEvent;
 use crate::state::{check_price_not_manipulated, observation_pool_id, seeds, value_in_token1, UserDeposit, Vault, MAX_SQRT_DEVIATION_WITHDRAW_BPS};
@@ -150,6 +151,14 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
         );
         // Active position always implies funds → always require an oracle reference.
         // Softer band on withdraw (audit M-2): volatility must never lock a user out.
+        //
+        // A7 (future, non-USDC SOL pairs): this `require_oracle = true` hard-fails
+        // when no fresh (≥30s) observation exists. For SOL/USDC that never happens
+        // (constant swap activity), so behavior is correct as-is. Before launching a
+        // low-liquidity non-USDC SOL pair, relax this: instead of hard-failing on a
+        // stale oracle, require a non-zero user min-out floor (min_token0_out > 0 &&
+        // min_token1_out > 0) so withdrawals stay available. Deliberate trade-off —
+        // do NOT change behavior here until such a pair is actually launched.
         check_price_not_manipulated(sqrt_price_x64, &obs_data, true, MAX_SQRT_DEVIATION_WITHDRAW_BPS)?;
     }
 
@@ -214,9 +223,9 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     let total_fees_token0 = ctx.accounts.token0_treasury.amount.saturating_sub(token0_before_fees);
     let total_fees_token1 = ctx.accounts.token1_treasury.amount.saturating_sub(token1_before_fees);
     let new_accumulated_fees_token0 = old_accumulated_fees_token0
-        .checked_add(total_fees_token0 / 10).ok_or(error!(VaultError::MathOverflow))?;
+        .checked_add(total_fees_token0 / PROTOCOL_FEE_DENOMINATOR).ok_or(error!(VaultError::MathOverflow))?;
     let new_accumulated_fees_token1 = old_accumulated_fees_token1
-        .checked_add(total_fees_token1 / 10).ok_or(error!(VaultError::MathOverflow))?;
+        .checked_add(total_fees_token1 / PROTOCOL_FEE_DENOMINATOR).ok_or(error!(VaultError::MathOverflow))?;
 
     // User's pro-rata of treasury (now includes their share of the 90% fees,
     // and excludes the protocol's accumulated cut).

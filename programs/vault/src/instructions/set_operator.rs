@@ -1,6 +1,7 @@
 use anchor_lang::prelude::*;
 
 use crate::errors::VaultError;
+use crate::events::OperatorChanged;
 use crate::state::{seeds, Vault};
 
 /// Set the hot operator key (admin only).
@@ -24,9 +25,11 @@ pub struct SetOperator<'info> {
 }
 
 pub fn handler(ctx: Context<SetOperator>, new_operator: Pubkey) -> Result<()> {
-    require!(new_operator != Pubkey::default(), VaultError::Unauthorized);
+    require!(new_operator != Pubkey::default(), VaultError::InvalidArgument);
     let vault = &mut ctx.accounts.vault;
+    let old_operator = vault.operator;
     vault.operator = new_operator;
     msg!("Operator set to {}", new_operator);
+    emit!(OperatorChanged { old_operator, new_operator });
     Ok(())
 }

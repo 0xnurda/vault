@@ -16,13 +16,13 @@ use crate::state::{seeds, validate_position_range, Vault};
 #[instruction(tick_lower_index: i32, tick_upper_index: i32, tick_array_lower_start_index: i32, tick_array_upper_start_index: i32)]
 pub struct OpenPosition<'info> {
     #[account(mut)]
-    pub admin: Signer<'info>,
+    pub operator: Signer<'info>,
 
     #[account(
         mut,
         seeds = [seeds::VAULT, vault.pool_id.as_ref()],
         bump = vault.bump,
-        constraint = vault.is_operator(&admin.key()) @ VaultError::Unauthorized,
+        constraint = vault.is_operator(&operator.key()) @ VaultError::Unauthorized,
         constraint = !vault.has_active_position @ VaultError::PositionAlreadyExists,
     )]
     pub vault: Box<Account<'info, Vault>>,
@@ -139,12 +139,23 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
         &ctx.accounts.vault.key().to_bytes(),
         &[vault.token0_treasury_bump],
     ];
+    // ── AUDIT NOTE (A2): delegate = `operator` here (vs `vault` in increase_liquidity). ──
+    // This asymmetry is REQUIRED by Raydium, not a bug. `open_position_with_token22_nft`
+    // takes a `payer` (= operator) which both funds the rent for the new NFT/position
+    // accounts AND is the authority Raydium uses to pull token0/token1 out of the
+    // treasuries. So the treasuries must `approve` the payer (operator) as SPL delegate.
+    // `increase_liquidity_v2` has no `payer`; its transfer authority is `nft_owner`
+    // (= vault), so there the delegate is the vault PDA.
+    // SAFETY: the approve is bounded by amount_{0,1}_max and the matching `revoke`
+    // below ALWAYS runs — on CPI success AND failure (see the no-`?` pattern) — so the
+    // allowance is 0 after this instruction; operator never holds a standing delegation.
+    // → Flagged for external-auditor review: confirm Raydium open requires payer-authority.
     anchor_spl::token_interface::approve(
         CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
             anchor_spl::token_interface::Approve {
                 to: ctx.accounts.token0_treasury.to_account_info(),
-                delegate: ctx.accounts.admin.to_account_info(),
+                delegate: ctx.accounts.operator.to_account_info(),
                 authority: ctx.accounts.token0_treasury.to_account_info(),
             },
             &[token0_treasury_seeds],
@@ -162,7 +173,7 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
             ctx.accounts.token_program.to_account_info(),
             anchor_spl::token_interface::Approve {
                 to: ctx.accounts.token1_treasury.to_account_info(),
-                delegate: ctx.accounts.admin.to_account_info(),
+                delegate: ctx.accounts.operator.to_account_info(),
                 authority: ctx.accounts.token1_treasury.to_account_info(),
             },
             &[token1_treasury_seeds],
@@ -171,7 +182,7 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     )?;
 
     let cpi_accounts = cpi::accounts::OpenPositionWithToken22Nft {
-        payer: ctx.accounts.admin.to_account_info(),
+        payer: ctx.accounts.operator.to_account_info(),
         position_nft_owner: ctx.accounts.vault.to_account_info(),
         position_nft_mint: ctx.accounts.position_nft_mint.to_account_info(),
         position_nft_account: ctx.accounts.position_nft_account.to_account_info(),
@@ -201,7 +212,7 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     .with_remaining_accounts(vec![ctx.accounts.tick_array_bitmap.to_account_info()]);
 
     // Save CPI result WITHOUT `?` — we must ALWAYS revoke even if CPI fails,
-    // otherwise admin retains a live SPL delegate on the treasury accounts.
+    // otherwise operator retains a live SPL delegate on the treasury accounts.
     let open_result = cpi::open_position_with_token22_nft(
         cpi_ctx,
         tick_lower_index,

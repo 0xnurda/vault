@@ -166,8 +166,8 @@ pub mod vault {
     }
 
     /// Full withdrawal from treasury (burn ALL shares, receive token0/token1 pro-rata).
-    /// Emergency mode: if `is_rebalancing` has been true for > 3600s, users may
-    /// still withdraw from whatever is in the treasury.
+    /// Available whenever there is no active position (all funds in treasury → pro-rata
+    /// is always correct), including during a rebalance — no time lock (A1).
     pub fn withdraw(ctx: Context<Withdraw>, min_token0_out: u64, min_token1_out: u64) -> Result<()> {
         instructions::withdraw::handler(ctx, min_token0_out, min_token1_out)
     }

@@ -26,6 +26,13 @@ pub fn validate_position_range(
     tick_current: i32,
     tick_spacing: i32,
 ) -> Result<()> {
+    // A5: bound ticks to the CLMM's valid range first. Without this, garbage
+    // ticks (e.g. i32::MIN/MAX) would overflow `tick_upper - tick_lower` and
+    // panic/revert (overflow-checks are on).
+    require!(
+        tick_lower >= MIN_TICK && tick_upper <= MAX_TICK,
+        VaultError::InvalidTickRange
+    );
     require!(tick_lower < tick_upper, VaultError::InvalidTickRange);
     let width = tick_upper - tick_lower;
 
@@ -115,9 +122,10 @@ pub struct Vault {
     pub accumulated_protocol_fees_token0: u64,
     /// Accumulated token1 protocol fees not yet extracted (excluded from TVL)
     pub accumulated_protocol_fees_token1: u64,
-    /// Unix timestamp when the current rebalance started (set by close_position).
-    /// Emergency withdrawal timeout: users can withdraw after 3600s even if rebalancing.
-    /// Cleared by open_position and cancel_rebalance.
+    /// Unix timestamp when the current rebalance started (set by close_position,
+    /// cleared by open_position and cancel_rebalance). Kept for observability; it is
+    /// no longer a withdrawal gate — since A1, `withdraw` is always available when
+    /// there is no active position (all funds in treasury).
     pub rebalance_started_at: i64,
     /// Hot operator key for automated operations (rebalance, collect_fees, swaps).
     /// Separate from admin: admin (cold/multisig) sets config; operator (hot bot)
@@ -177,30 +185,6 @@ impl Vault {
         8  + // last_fee_collection_slot (u64) — audit M-1
         8;   // last_swap_at (i64) — audit M-3 (consumed remaining padding; LEN unchanged)
 
-    /// Calculate TVL in token1 units using on-chain pool price.
-    ///
-    /// For SOL/USDC pools: token1 = USDC → TVL is in USDC micro-units ≈ USD.
-    /// accumulated_protocol_fees are excluded (they belong to the protocol).
-    ///
-    /// token0_price_in_token1: price of 1 token0 in token1 units
-    ///   (with token1_decimals decimal places)
-    pub fn calculate_tvl(&self, token0_price_in_token1: u64) -> u64 {
-        let user_token0 = self.treasury_token0
-            .saturating_add(self.position_token0)
-            .saturating_sub(self.accumulated_protocol_fees_token0);
-        let user_token1 = self.treasury_token1
-            .saturating_add(self.position_token1)
-            .saturating_sub(self.accumulated_protocol_fees_token1);
-
-        let token0_value = (user_token0 as u128)
-            .checked_mul(token0_price_in_token1 as u128)
-            .and_then(|v| v.checked_div(10u128.pow(self.token0_decimals as u32)))
-            .and_then(|v| u64::try_from(v).ok())
-            .unwrap_or(0);
-
-        token0_value.saturating_add(user_token1)
-    }
-
     /// TVL using real-time position amounts (computed from pool + position accounts).
     /// Used by deposit_token0 / deposit_token1 for accurate share pricing.
     pub fn calculate_tvl_with_position(
@@ -252,22 +236,6 @@ impl Vault {
         }
     }
 
-    /// token1 value of given shares given current TVL.
-    pub fn calculate_withdrawal_value(
-        &self,
-        shares: u64,
-        current_tvl: u64,
-    ) -> Result<u64> {
-        if self.total_shares == 0 {
-            return Ok(0);
-        }
-        (shares as u128)
-            .checked_mul(current_tvl as u128)
-            .and_then(|v| v.checked_div(self.total_shares as u128))
-            .and_then(|v| u64::try_from(v).ok())
-            .ok_or(error!(VaultError::MathOverflow))
-    }
-
     /// Convert token0 amount to token1 units using pool price.
     pub fn token0_to_token1(&self, amount: u64, token0_price_in_token1: u64) -> u64 {
         (amount as u128)
@@ -275,16 +243,6 @@ impl Vault {
             .and_then(|v| v.checked_div(10u128.pow(self.token0_decimals as u32)))
             .and_then(|v| u64::try_from(v).ok())
             .unwrap_or(0)
-    }
-
-    /// User-accessible treasury token0 (excluding protocol fees).
-    pub fn user_treasury_token0(&self) -> u64 {
-        self.treasury_token0.saturating_sub(self.accumulated_protocol_fees_token0)
-    }
-
-    /// User-accessible treasury token1 (excluding protocol fees).
-    pub fn user_treasury_token1(&self) -> u64 {
-        self.treasury_token1.saturating_sub(self.accumulated_protocol_fees_token1)
     }
 
     /// True if `key` may run operational actions (rebalance, collect_fees, swap).
@@ -305,36 +263,6 @@ impl Vault {
 // change is needed here. (Contrast ObservationState, which Raydium shrank to a
 // 100-slot cumulative-tick layout — that one we had to re-parse from raw bytes.)
 // The crate rev is pinned in Cargo.toml so this layout can't shift unnoticed.
-
-/// Byte offset of `token_mint_0` in a Raydium CLMM PoolState account.
-const POOL_TOKEN_MINT_0_OFFSET: usize = 73;
-
-/// Byte offset of `sqrt_price_x64` in a Raydium CLMM PoolState account.
-const POOL_SQRT_PRICE_OFFSET: usize = 253;
-
-/// Byte offset of `tick_current` (i32) in a Raydium CLMM PoolState account.
-const POOL_TICK_CURRENT_OFFSET: usize = 269;
-
-/// Read `token_mint_0` from raw Raydium CLMM pool account bytes.
-pub fn read_pool_token_mint_0(data: &[u8]) -> Option<Pubkey> {
-    let end = POOL_TOKEN_MINT_0_OFFSET + 32;
-    let bytes: [u8; 32] = data.get(POOL_TOKEN_MINT_0_OFFSET..end)?.try_into().ok()?;
-    Some(Pubkey::from(bytes))
-}
-
-/// Read `sqrt_price_x64` (u128, little-endian) from raw Raydium CLMM pool bytes.
-pub fn read_pool_sqrt_price_x64(data: &[u8]) -> Option<u128> {
-    let end = POOL_SQRT_PRICE_OFFSET + 16;
-    let bytes: [u8; 16] = data.get(POOL_SQRT_PRICE_OFFSET..end)?.try_into().ok()?;
-    Some(u128::from_le_bytes(bytes))
-}
-
-/// Read `tick_current` (i32, little-endian) from raw Raydium CLMM pool bytes.
-pub fn read_pool_tick_current(data: &[u8]) -> Option<i32> {
-    let end = POOL_TICK_CURRENT_OFFSET + 4;
-    let bytes: [u8; 4] = data.get(POOL_TICK_CURRENT_OFFSET..end)?.try_into().ok()?;
-    Some(i32::from_le_bytes(bytes))
-}
 
 /// Convert Raydium CLMM `sqrt_price_x64` (Q64.64) to token0 price in token1 units.
 ///
@@ -504,6 +432,8 @@ pub struct UserDeposit {
     pub shares: u64,
     pub total_deposited_token0: u64,
     pub total_deposited_token1: u64,
+    /// DEPRECATED / unused. Kept to preserve the on-chain UserDeposit byte layout
+    /// (removing it would shift every existing depositor account → requires migration).
     pub total_withdrawn_value: u64,
     pub created_at: i64,
     pub updated_at: i64,
@@ -523,7 +453,6 @@ pub mod seeds {
     pub const TOKEN1_TREASURY: &[u8] = b"token1_treasury";
     pub const SHARE_MINT: &[u8] = b"share_mint";
     pub const USER_DEPOSIT: &[u8] = b"user_deposit";
-    pub const POSITION_NFT: &[u8] = b"position_nft";
 }
 
 
