@@ -890,6 +890,121 @@ mod math_tests {
         assert_eq!(sqrt_price_to_price(1, false, 6, 6), None);
     }
 
+    // ── NEW-2: check_price_not_manipulated guard against a real obs buffer ─────
+    //
+    // Build a minimal ObservationState account (raw bytes, current layout) with
+    // two checkpoints spanning ≥30 s at a constant tick, so reference_sqrt_price
+    // resolves to get_sqrt_price_at_tick(tick). Then assert spot within / out of
+    // band passes / reverts.
+    fn make_obs_buffer(pool_id: Pubkey, newest_ts: u32, older_ts: u32, tick: i64) -> Vec<u8> {
+        // total size must cover OBS_OBSERVATIONS_OFFSET + OBS_NUM * OBS_ENTRY_LEN
+        let mut buf = vec![0u8; OBS_OBSERVATIONS_OFFSET + OBS_NUM * OBS_ENTRY_LEN];
+        buf[OBS_INITIALIZED_OFFSET] = 1; // initialized = true
+        buf[OBS_POOL_ID_OFFSET..OBS_POOL_ID_OFFSET + 32].copy_from_slice(pool_id.as_ref());
+
+        // tick_cumulative grows by `tick` per second → constant avg tick.
+        let write = |buf: &mut [u8], slot: usize, ts: u32| {
+            let base = OBS_OBSERVATIONS_OFFSET + slot * OBS_ENTRY_LEN;
+            buf[base..base + 4].copy_from_slice(&ts.to_le_bytes());
+            let cum: i64 = tick * ts as i64;
+            buf[base + 4..base + 12].copy_from_slice(&cum.to_le_bytes());
+        };
+        write(&mut buf, 0, older_ts);
+        write(&mut buf, 1, newest_ts);
+        buf
+    }
+
+    #[test]
+    fn new2_guard_within_band_passes() {
+        let pool = Pubkey::new_unique();
+        // 30 s window at tick 0 → reference sqrt = get_sqrt_price_at_tick(0) = 2^64.
+        let obs = make_obs_buffer(pool, 100, 60, 0);
+        let reference = get_sqrt_price_at_tick(0);
+        // spot exactly at reference (0 deviation) must pass under the deposit band.
+        assert!(check_price_not_manipulated(reference, &obs, true, MAX_SQRT_DEVIATION_BPS).is_ok());
+        // spot 1% above reference in sqrt terms is still inside the 2.5% band.
+        let spot = reference + reference / 100;
+        assert!(check_price_not_manipulated(spot, &obs, true, MAX_SQRT_DEVIATION_BPS).is_ok());
+    }
+
+    #[test]
+    fn new2_guard_out_of_band_reverts() {
+        let pool = Pubkey::new_unique();
+        let obs = make_obs_buffer(pool, 100, 60, 0);
+        let reference = get_sqrt_price_at_tick(0);
+        // spot 5% above reference in sqrt terms exceeds the 2.5% deposit band → revert.
+        let spot = reference + reference / 20;
+        assert!(check_price_not_manipulated(spot, &obs, true, MAX_SQRT_DEVIATION_BPS).is_err());
+    }
+
+    #[test]
+    fn new2_observation_pool_id_roundtrips() {
+        let pool = Pubkey::new_unique();
+        let obs = make_obs_buffer(pool, 100, 60, 0);
+        // The guard's pool_id check reads exactly this; must roundtrip.
+        assert_eq!(observation_pool_id(&obs), Some(pool));
+        // A different vault pool_id must NOT match.
+        assert_ne!(observation_pool_id(&obs), Some(Pubkey::new_unique()));
+    }
+
+    #[test]
+    fn new2_no_30s_window_is_failsafe_when_required() {
+        // Only one checkpoint (no ≥30 s window) → reference_sqrt_price = None.
+        // With require_reference = true (vault holds funds) this must FAIL-SAFE.
+        let pool = Pubkey::new_unique();
+        let mut obs = make_obs_buffer(pool, 100, 80, 0); // window only 20 s < 30 s
+        let _ = &mut obs;
+        let spot = get_sqrt_price_at_tick(0);
+        assert!(check_price_not_manipulated(spot, &obs, true, MAX_SQRT_DEVIATION_BPS).is_err());
+        // When NOT required (empty vault), the same missing window is allowed.
+        assert!(check_price_not_manipulated(spot, &obs, false, MAX_SQRT_DEVIATION_BPS).is_ok());
+    }
+
+    // ── NEW-1: live-liquidity pro-rata math (withdraw_from_position) ───────────
+    //
+    // user_liquidity = position_liquidity × shares_amount / total_shares, where
+    // position_liquidity now comes from the LIVE position. This mirrors the exact
+    // checked-math expression in the handler. The key property: if the stale cache
+    // were ABOVE the live value, using the cache would over-remove principal;
+    // using the live value caps removal at the true pro-rata share.
+    fn pro_rata_liquidity(position_liquidity: u128, shares_amount: u128, total_shares: u128) -> u128 {
+        position_liquidity
+            .checked_mul(shares_amount)
+            .and_then(|v| v.checked_div(total_shares))
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn new1_pro_rata_uses_live_not_cache() {
+        // Live position has 1_000 liquidity; a stale cache claims 1_500.
+        let live = 1_000u128;
+        let stale_cache = 1_500u128;
+        let shares = 50u128;
+        let total = 100u128;
+
+        // Fair (live) share = 1000 * 50 / 100 = 500.
+        assert_eq!(pro_rata_liquidity(live, shares, total), 500);
+        // Cache-based would over-remove: 1500 * 50 / 100 = 750 > 500.
+        assert!(pro_rata_liquidity(stale_cache, shares, total) > pro_rata_liquidity(live, shares, total));
+    }
+
+    #[test]
+    fn new1_pro_rata_full_redeem_and_zero() {
+        // Redeeming 100% of shares removes 100% of live liquidity.
+        assert_eq!(pro_rata_liquidity(1_000, 100, 100), 1_000);
+        // Zero live liquidity → zero removal, never panics.
+        assert_eq!(pro_rata_liquidity(0, 50, 100), 0);
+    }
+
+    #[test]
+    fn new1_cache_decrement_saturates() {
+        // After NEW-1 the source can exceed the analytics cache; the end-of-handler
+        // `vault.position_liquidity.saturating_sub(user_liquidity)` must not underflow.
+        let cache: u128 = 800;        // stale, BELOW the live-derived removal
+        let user_liquidity: u128 = 1_000;
+        assert_eq!(cache.saturating_sub(user_liquidity), 0);
+    }
+
     #[test]
     fn shares_mint_dust_tvl_does_not_overflow() {
         // L-2: DEAD_SHARES + a tiny stuck holder, TVL collapsed to dust. A large

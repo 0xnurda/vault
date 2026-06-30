@@ -9,7 +9,9 @@ use raydium_clmm_cpi::{
 
 use crate::errors::VaultError;
 use crate::events::LiquidityIncreased;
-use crate::state::{seeds, Vault};
+use crate::state::{
+    check_price_not_manipulated, observation_pool_id, seeds, Vault, MAX_SQRT_DEVIATION_BPS,
+};
 
 #[derive(Accounts)]
 pub struct IncreaseLiquidity<'info> {
@@ -44,6 +46,11 @@ pub struct IncreaseLiquidity<'info> {
         constraint = pool_state.key() == vault.pool_id @ VaultError::InvalidPriceFeed,
     )]
     pub pool_state: AccountLoader<'info, PoolState>,
+
+    /// CHECK: Raydium CLMM ObservationState for the TWAP manipulation guard
+    /// (NEW-2). Validated in the handler: owner == Raydium CLMM program and its
+    /// pool_id == vault.pool_id. Parsed as raw bytes.
+    pub observation_state: UncheckedAccount<'info>,
 
     #[account(
         constraint = position_nft_account.amount == 1,
@@ -92,6 +99,23 @@ pub fn handler(
 ) -> Result<()> {
     require!(liquidity > 0 || amount_0_max > 0, VaultError::InvalidAmount);
     require!(slippage_bps <= MAX_SLIPPAGE_BPS, VaultError::SlippageTooHigh);
+
+    // ── NEW-2: price-manipulation guard BEFORE deploying treasury funds ────────
+    // increase_liquidity commits treasury token0/token1 at the CURRENT spot ratio.
+    // A compromised operator could increase during a self-induced price
+    // dislocation. Mirror the deposit guard: spot must be within
+    // MAX_SQRT_DEVIATION_BPS of the ≥30 s observation.
+    {
+        let sqrt_price_x64 = ctx.accounts.pool_state.load()?.sqrt_price_x64;
+        let obs_ai = &ctx.accounts.observation_state;
+        require!(obs_ai.owner == &raydium_clmm_cpi::id(), VaultError::InvalidPriceFeed);
+        let obs_data = obs_ai.try_borrow_data()?;
+        require!(
+            observation_pool_id(&obs_data) == Some(ctx.accounts.vault.pool_id),
+            VaultError::InvalidPriceFeed
+        );
+        check_price_not_manipulated(sqrt_price_x64, &obs_data, true, MAX_SQRT_DEVIATION_BPS)?;
+    }
 
     let vault = &ctx.accounts.vault;
 

@@ -10,7 +10,10 @@ use raydium_clmm_cpi::{
 
 use crate::errors::VaultError;
 use crate::events::PositionOpened;
-use crate::state::{seeds, validate_position_range, Vault};
+use crate::state::{
+    check_price_not_manipulated, observation_pool_id, seeds, validate_position_range, Vault,
+    MAX_SQRT_DEVIATION_BPS,
+};
 
 #[derive(Accounts)]
 #[instruction(tick_lower_index: i32, tick_upper_index: i32, tick_array_lower_start_index: i32, tick_array_upper_start_index: i32)]
@@ -46,6 +49,11 @@ pub struct OpenPosition<'info> {
         constraint = pool_state.key() == vault.pool_id @ VaultError::InvalidPriceFeed,
     )]
     pub pool_state: AccountLoader<'info, PoolState>,
+
+    /// CHECK: Raydium CLMM ObservationState for the TWAP manipulation guard
+    /// (NEW-2). Validated in the handler: owner == Raydium CLMM program and its
+    /// pool_id == vault.pool_id. Parsed as raw bytes.
+    pub observation_state: UncheckedAccount<'info>,
 
     #[account(mut)]
     pub position_nft_mint: Signer<'info>,
@@ -115,6 +123,24 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
             pool.tick_current,
             pool.tick_spacing as i32,
         )?;
+    }
+
+    // ── NEW-2: price-manipulation guard BEFORE deploying treasury funds ────────
+    // open_position commits treasury token0/token1 at the CURRENT spot ratio. A
+    // compromised operator could open during a self-induced price dislocation to
+    // mis-deploy the vault. Mirror the deposit guard: spot must be within
+    // MAX_SQRT_DEVIATION_BPS of the ≥30 s observation. Re-load pool_state here —
+    // the earlier load above was dropped at its block end.
+    {
+        let sqrt_price_x64 = ctx.accounts.pool_state.load()?.sqrt_price_x64;
+        let obs_ai = &ctx.accounts.observation_state;
+        require!(obs_ai.owner == &raydium_clmm_cpi::id(), VaultError::InvalidPriceFeed);
+        let obs_data = obs_ai.try_borrow_data()?;
+        require!(
+            observation_pool_id(&obs_data) == Some(ctx.accounts.vault.pool_id),
+            VaultError::InvalidPriceFeed
+        );
+        check_price_not_manipulated(sqrt_price_x64, &obs_data, true, MAX_SQRT_DEVIATION_BPS)?;
     }
 
     let vault = &ctx.accounts.vault;

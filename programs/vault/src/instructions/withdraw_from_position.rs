@@ -175,7 +175,15 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     let token1_treasury_bump = ctx.accounts.vault.token1_treasury_bump;
     let old_accumulated_fees_token0 = ctx.accounts.vault.accumulated_protocol_fees_token0;
     let old_accumulated_fees_token1 = ctx.accounts.vault.accumulated_protocol_fees_token1;
-    let position_liquidity = ctx.accounts.vault.position_liquidity;
+    // NEW-1: source position liquidity from the LIVE position account, NOT the
+    // cached `vault.position_liquidity`. The cache is updated by the permissionless
+    // `sync_position_value` and other handlers and can drift ABOVE the real value;
+    // if it does, the pro-rata `user_liquidity` below would remove MORE principal
+    // than the withdrawer's fair share, shorting the remaining holders. The
+    // `personal_position` account is constrained `pool_id == pool_state.key()`, so
+    // its `liquidity` is the authoritative on-chain value. Read it into a local
+    // BEFORE any mutable borrow of the vault (borrow-checker + existing ordering).
+    let position_liquidity = ctx.accounts.personal_position.liquidity;
     let vault_key = ctx.accounts.vault.key();
     let pool_id = ctx.accounts.vault.pool_id;
 
