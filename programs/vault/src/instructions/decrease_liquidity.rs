@@ -11,7 +11,7 @@ use raydium_clmm_cpi::{
 use crate::constants::PROTOCOL_FEE_DENOMINATOR;
 use crate::errors::VaultError;
 use crate::events::LiquidityDecreased;
-use crate::state::{seeds, Vault};
+use crate::state::{count_initialized_rewards, seeds, validate_reward_recipients, Vault};
 
 #[derive(Accounts)]
 pub struct DecreaseLiquidity<'info> {
@@ -112,6 +112,14 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
 
     let pool_id = vault.pool_id;
     let vault_seeds: &[&[&[u8]]] = &[&[seeds::VAULT, pool_id.as_ref(), &[vault.bump]]];
+
+    // NEW-3: ensure every reward recipient forwarded for the CPI is vault-owned.
+    {
+        let pool = ctx.accounts.pool_state.load()?;
+        let num_rewards = count_initialized_rewards(&pool.reward_infos);
+        drop(pool);
+        validate_reward_recipients(&remaining, &ctx.accounts.vault.key(), num_rewards)?;
+    }
 
     // M-1: capture owed fees before the decrease sweeps them into treasury, so the
     // protocol's 10% cut isn't forfeited. No extra CPI — field read + arithmetic.

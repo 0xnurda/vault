@@ -91,4 +91,7 @@ pub enum VaultError {
 
     #[msg("A position is active — use withdraw_from_position instead")]
     UseWithdrawFromPosition,
+
+    #[msg("Reward recipient must be a vault-owned token account")]
+    InvalidRewardRecipient,
 }

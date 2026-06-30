@@ -11,7 +11,7 @@ use raydium_clmm_cpi::{
 use crate::constants::PROTOCOL_FEE_DENOMINATOR;
 use crate::errors::VaultError;
 use crate::events::FeesCollected;
-use crate::state::{seeds, Vault};
+use crate::state::{count_initialized_rewards, seeds, validate_reward_recipients, Vault};
 
 /// Collect accumulated trading fees from the position.
 /// 10% of fees → accumulated_protocol_fees (tracked separately, excluded from TVL).
@@ -92,6 +92,17 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(ctx: Context<'a, 'b, 'c, 'info, Collect
     // pairs for each initialized reward on the pool. Without them the CPI returns
     // InvalidRewardInputAccountNumber on reward-enabled pools.
     let remaining = ctx.remaining_accounts.to_vec();
+
+    // NEW-3: validate every reward recipient in remaining_accounts is vault-owned
+    // BEFORE the CPI, so a caller can't redirect the position's LM rewards to their
+    // own ATA. Count initialized rewards from the live pool (borrow scoped/dropped
+    // before the CPI re-borrows pool_state).
+    {
+        let pool = ctx.accounts.pool_state.load()?;
+        let num_rewards = count_initialized_rewards(&pool.reward_infos);
+        drop(pool);
+        validate_reward_recipients(&remaining, &ctx.accounts.vault.key(), num_rewards)?;
+    }
 
     let vault = &ctx.accounts.vault;
     let pool_id = vault.pool_id;

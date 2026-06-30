@@ -13,7 +13,7 @@ use raydium_clmm_cpi::{
 use crate::constants::PROTOCOL_FEE_DENOMINATOR;
 use crate::errors::VaultError;
 use crate::events::WithdrawEvent;
-use crate::state::{check_price_not_manipulated, observation_pool_id, seeds, value_in_token1, UserDeposit, Vault, MAX_SQRT_DEVIATION_WITHDRAW_BPS};
+use crate::state::{check_price_not_manipulated, count_initialized_rewards, observation_pool_id, seeds, validate_reward_recipients, value_in_token1, UserDeposit, Vault, MAX_SQRT_DEVIATION_WITHDRAW_BPS};
 
 #[derive(Accounts)]
 pub struct WithdrawFromPosition<'info> {
@@ -160,6 +160,19 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
         // min_token1_out > 0) so withdrawals stay available. Deliberate trade-off —
         // do NOT change behavior here until such a pair is actually launched.
         check_price_not_manipulated(sqrt_price_x64, &obs_data, true, MAX_SQRT_DEVIATION_WITHDRAW_BPS)?;
+    }
+
+    // NEW-3: this instruction is PERMISSIONLESS — any depositor calls it and supplies
+    // `remaining_accounts`. Both decrease CPIs below collect the position's LM rewards
+    // into the recipient at group index [1]; without this guard a caller could pass
+    // their own ATA and steal the whole position's accrued rewards (which must land in
+    // the vault-owned reward ATA, later swept by admin-only `extract_rewards`). Same
+    // `remaining` feeds CPI1 and CPI2, so one check before CPI1 covers both.
+    {
+        let pool = ctx.accounts.pool_state.load()?;
+        let num_rewards = count_initialized_rewards(&pool.reward_infos);
+        drop(pool);
+        validate_reward_recipients(&remaining, &ctx.accounts.vault.key(), num_rewards)?;
     }
 
     // Use actual share token balance (audit finding #2 fix). The caller always

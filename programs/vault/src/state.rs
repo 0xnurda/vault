@@ -686,6 +686,99 @@ pub fn value_in_token1(ref_sqrt_x64: u128, amount: u64, amount_is_pool_token0: b
     (amount as u128).checked_mul(price_x64).map(|v| v >> 64)
 }
 
+// ─── NEW-3: reward-recipient validation for decrease_liquidity_v2 CPI ──────────
+//
+// Raydium's `decrease_liquidity_v2` collects LM rewards into a CALLER-SUPPLIED
+// `recipient_token_account`, only checking `recipient.mint == reward_vault.mint`
+// and `reward_vault == pool.reward_infos[i].token_vault` — it does NOT verify the
+// recipient's OWNER. The reward accounts ride in `remaining_accounts`, grouped per
+// initialized reward in the order:
+//   [ reward_token_vault, recipient_token_account, (reward_vault_mint — Token-2022 only) ]
+// `recipient_token_account` is always at group index [1]. Group size is per-call,
+// pool-wide (2 for SPL rewards, 3 if ANY reward mint is Token-2022 — Raydium's
+// `reward_group_account_num`). Without validation a caller of the permissionless
+// `withdraw_from_position` (or any operator path) could pass their own ATA at
+// index [1] and siphon the whole position's accrued rewards, which must instead
+// land in the vault-owned reward ATA later swept by the admin-only `extract_rewards`.
+//
+// `reward_group_size` derives the group size robustly from the actual lengths
+// rather than hardcoding: given the number of INITIALIZED pool rewards
+// (`num_pool_rewards`, counted from `pool_state.reward_infos`) it requires that
+// `remaining.len()` divides evenly by it. This stays aligned with Raydium's rule:
+// every group has the same width, so `len / num_rewards` is the per-reward width
+// (2 or 3) for THIS call. Empty `remaining` → no rewards collected → no groups.
+// Fail-closed: any inconsistency (no rewards but accounts present, non-divisible
+// length, zero-width group) returns None so the caller reverts.
+pub fn reward_group_size(remaining_len: usize, num_pool_rewards: usize) -> Option<usize> {
+    if remaining_len == 0 {
+        return Some(0); // nothing to collect — no-op
+    }
+    if num_pool_rewards == 0 {
+        return None; // accounts supplied but pool has no initialized rewards
+    }
+    if remaining_len % num_pool_rewards != 0 {
+        return None; // ragged grouping — cannot trust the layout
+    }
+    let n = remaining_len / num_pool_rewards;
+    // Raydium uses 2 (SPL) or 3 (Token-2022 present). Reject anything else as
+    // an unexpected layout we won't blindly index into.
+    if n == 2 || n == 3 {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+/// Validate every reward `recipient_token_account` (group index [1]) forwarded in
+/// `remaining` is owned by the vault PDA, BEFORE the `decrease_liquidity_v2` CPI.
+/// `num_pool_rewards` is the count of INITIALIZED rewards on the pool (read from
+/// the already-loaded `pool_state.reward_infos`). Fail-closed on any parse/layout
+/// problem. The legit recipient (the vault-owned reward ATA the backend already
+/// passes) still passes.
+pub fn validate_reward_recipients(
+    remaining: &[AccountInfo],
+    vault_key: &Pubkey,
+    num_pool_rewards: usize,
+) -> Result<()> {
+    let group = reward_group_size(remaining.len(), num_pool_rewards)
+        .ok_or(error!(VaultError::InvalidRewardRecipient))?;
+    if group == 0 {
+        return Ok(()); // empty remaining → no rewards to collect
+    }
+    for chunk in remaining.chunks(group) {
+        // chunk[1] is the recipient_token_account. chunks() guarantees full-width
+        // chunks here because we already verified len % group == 0.
+        let recipient = &chunk[1];
+        // Read only the SPL token-account `owner` field (offset 32) without a full
+        // deserialize — keeps the per-group loop off the SBF stack. Layout is
+        // identical for SPL-Token and Token-2022 base accounts.
+        let data = recipient
+            .try_borrow_data()
+            .map_err(|_| error!(VaultError::InvalidRewardRecipient))?;
+        require!(data.len() >= 64, VaultError::InvalidRewardRecipient);
+        let owner = Pubkey::try_from(&data[32..64])
+            .map_err(|_| error!(VaultError::InvalidRewardRecipient))?;
+        require_keys_eq!(owner, *vault_key, VaultError::InvalidRewardRecipient);
+    }
+    Ok(())
+}
+
+/// Count INITIALIZED rewards on a Raydium pool from its `reward_infos`. A slot is
+/// considered initialized when its `token_mint` is non-default (mirrors Raydium's
+/// own "reward enabled" signal). `token_mint` is read into a local first because
+/// `PoolState` is `#[repr(C, packed)]` (unaligned field — taking a reference is UB).
+pub fn count_initialized_rewards(
+    reward_infos: &[raydium_clmm_cpi::states::RewardInfo],
+) -> usize {
+    reward_infos
+        .iter()
+        .filter(|r| {
+            let mint = r.token_mint; // copy out of the packed struct
+            mint != Pubkey::default()
+        })
+        .count()
+}
+
 // ─── Math regression tests (audit checklist #2) ───────────────────────────────
 #[cfg(test)]
 mod math_tests {
@@ -1016,5 +1109,59 @@ mod math_tests {
             .calculate_shares_to_mint(u64::MAX, dust_tvl)
             .expect("must not revert");
         assert_eq!(shares, u64::MAX); // fresh-start fallback
+    }
+
+    // ── NEW-3: reward-recipient group-size math ───────────────────────────────
+    // These cover the pure index/divisibility logic of `reward_group_size`. The
+    // owner-equality check itself (recipient.owner == vault PDA) is enforced at
+    // runtime in `validate_reward_recipients` and exercised by integration tests
+    // (constructing real AccountInfos with backing data is impractical here).
+    #[test]
+    fn reward_group_empty_is_noop() {
+        // No reward accounts forwarded → group size 0 (handler treats as no-op).
+        assert_eq!(reward_group_size(0, 0), Some(0));
+        assert_eq!(reward_group_size(0, 3), Some(0));
+    }
+
+    #[test]
+    fn reward_group_spl_width_two() {
+        // 1 SPL reward → [vault, recipient] = 2 accounts.
+        assert_eq!(reward_group_size(2, 1), Some(2));
+        // 2 SPL rewards → 4 accounts, width 2.
+        assert_eq!(reward_group_size(4, 2), Some(2));
+        // 3 SPL rewards → 6 accounts, width 2.
+        assert_eq!(reward_group_size(6, 3), Some(2));
+    }
+
+    #[test]
+    fn reward_group_token2022_width_three() {
+        // Token-2022 reward present → [vault, recipient, mint] = 3 per reward.
+        assert_eq!(reward_group_size(3, 1), Some(3));
+        assert_eq!(reward_group_size(6, 2), Some(3));
+        assert_eq!(reward_group_size(9, 3), Some(3));
+    }
+
+    #[test]
+    fn reward_group_rejects_accounts_without_rewards() {
+        // Caller forwarded accounts but the pool has zero initialized rewards →
+        // fail-closed (None), so the handler reverts.
+        assert_eq!(reward_group_size(2, 0), None);
+        assert_eq!(reward_group_size(4, 0), None);
+    }
+
+    #[test]
+    fn reward_group_rejects_non_divisible() {
+        // 5 accounts can't split evenly into 2 groups → None.
+        assert_eq!(reward_group_size(5, 2), None);
+        // 7 accounts / 2 rewards → ragged → None.
+        assert_eq!(reward_group_size(7, 2), None);
+    }
+
+    #[test]
+    fn reward_group_rejects_unexpected_width() {
+        // Width must be 2 or 3. 1 account / 1 reward (width 1) → None.
+        assert_eq!(reward_group_size(1, 1), None);
+        // width 4 (e.g. 8 accts / 2 rewards) is not a Raydium layout → None.
+        assert_eq!(reward_group_size(8, 2), None);
     }
 }

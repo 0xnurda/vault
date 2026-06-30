@@ -11,7 +11,7 @@ use raydium_clmm_cpi::{
 use crate::constants::PROTOCOL_FEE_DENOMINATOR;
 use crate::errors::VaultError;
 use crate::events::PositionClosed;
-use crate::state::{seeds, Vault};
+use crate::state::{count_initialized_rewards, seeds, validate_reward_recipients, Vault};
 
 #[derive(Accounts)]
 pub struct ClosePosition<'info> {
@@ -114,6 +114,15 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(ctx: Context<'a, 'b, 'c, 'info, ClosePo
     let protocol_fee_token1 = ctx.accounts.personal_position.token_fees_owed_1 / PROTOCOL_FEE_DENOMINATOR;
 
     let vault_seeds: &[&[&[u8]]] = &[&[seeds::VAULT, pool_id.as_ref(), &[vault.bump]]];
+
+    // NEW-3: validate reward recipients (vault-owned) before the decrease CPI that
+    // collects LM rewards. Borrow of pool_state is scoped/dropped before the CPI.
+    {
+        let pool = ctx.accounts.pool_state.load()?;
+        let num_rewards = count_initialized_rewards(&pool.reward_infos);
+        drop(pool);
+        validate_reward_recipients(&remaining, &ctx.accounts.vault.key(), num_rewards)?;
+    }
 
     // ── Lean close (Kamino-style) ─────────────────────────────────────────
     // Fees are NOT split here. The keeper bot must call `collect_fees` BEFORE
