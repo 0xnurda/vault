@@ -10,7 +10,8 @@ use raydium_clmm_cpi::{
 use crate::errors::VaultError;
 use crate::events::LiquidityIncreased;
 use crate::state::{
-    check_price_not_manipulated, observation_pool_id, seeds, Vault, MAX_SQRT_DEVIATION_BPS,
+    check_observation_layout, check_price_not_manipulated, observation_pool_id, seeds, Vault,
+    MAX_SQRT_DEVIATION_BPS,
 };
 
 #[derive(Accounts)]
@@ -110,6 +111,7 @@ pub fn handler(
         let obs_ai = &ctx.accounts.observation_state;
         require!(obs_ai.owner == &raydium_clmm_cpi::id(), VaultError::InvalidPriceFeed);
         let obs_data = obs_ai.try_borrow_data()?;
+        check_observation_layout(&obs_data)?; // L-5: size tripwire (shrink-only layout)
         require!(
             observation_pool_id(&obs_data) == Some(ctx.accounts.vault.pool_id),
             VaultError::InvalidPriceFeed
