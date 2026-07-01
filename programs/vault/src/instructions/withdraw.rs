@@ -18,11 +18,20 @@ pub struct Withdraw<'info> {
     )]
     pub vault: Box<Account<'info, Vault>>,
 
+    // NEW-5: init_if_needed so a holder who received shares by SPL transfer (and
+    // thus has no UserDeposit PDA) can still withdraw — and cannot be frozen out
+    // when the vault is paused (deposits, which create this PDA, are blocked while
+    // paused). Canonical `bump` (a freshly-created zeroed account stores bump 0, so
+    // `bump = user_deposit.bump` would fail). The account-level owner constraint is
+    // removed (it would revert on the just-created zeroed account); authorization is
+    // enforced by the PDA seeds (bound to vault + user) and re-checked in the handler
+    // for pre-existing accounts.
     #[account(
-        mut,
+        init_if_needed,
+        payer = user,
+        space = UserDeposit::LEN,
         seeds = [seeds::USER_DEPOSIT, vault.key().as_ref(), user.key().as_ref()],
-        bump = user_deposit.bump,
-        constraint = user_deposit.user == user.key(),
+        bump,
     )]
     pub user_deposit: Box<Account<'info, UserDeposit>>,
 
@@ -74,6 +83,7 @@ pub struct Withdraw<'info> {
     pub raydium_pool: AccountLoader<'info, PoolState>,
 
     pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
 }
 
 /// `min_token0_out` — minimum token0 amount accepted (0 = no check)
@@ -82,6 +92,21 @@ pub fn handler(ctx: Context<Withdraw>, min_token0_out: u64, min_token1_out: u64)
     let vault = &mut ctx.accounts.vault;
     let user_deposit = &mut ctx.accounts.user_deposit;
     let current_time = Clock::get()?.unix_timestamp;
+
+    // NEW-5: initialize a freshly-created UserDeposit (transferred-share holder who
+    // never deposited), or authorize a pre-existing one. Must run before any use of
+    // user_deposit. `created_at == 0` uniquely identifies a fresh (zeroed) account —
+    // every real deposit sets created_at to a non-zero timestamp.
+    let user_key = ctx.accounts.user.key();
+    let vault_key = vault.key();
+    if user_deposit.created_at == 0 {
+        user_deposit.user = user_key;
+        user_deposit.vault = vault_key;
+        user_deposit.bump = ctx.bumps.user_deposit;
+        user_deposit.created_at = current_time;
+    } else {
+        require!(user_deposit.user == user_key, VaultError::Unauthorized);
+    }
 
     // H-2: pause MUST NOT block withdrawals — only deposits (see deposit_token*).
     // Deposited funds stay always-redeemable; otherwise admin could freeze them.

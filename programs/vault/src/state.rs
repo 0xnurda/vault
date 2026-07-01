@@ -499,6 +499,29 @@ const OBS_OBSERVATIONS_OFFSET: usize = OBS_POOL_ID_OFFSET + 32;     // 51
 const OBS_ENTRY_LEN: usize = 44;
 const OBS_NUM: usize = 100;
 
+/// Minimum bytes the ObservationState parser needs to read every field it
+/// touches: discriminator + header + all 100 observation slots. Derived from the
+/// verified offset constants — NOT a hardcoded magic number (M-1).
+///
+/// M-1 Raydium-layout tripwire: the parsers above are individually bounds-safe
+/// (`.get(range)?`), but a silent Raydium shrink of ObservationState would make
+/// them return None on every read and quietly disable the oracle. This explicit
+/// `>=` assertion fails LOUDLY instead. It uses `>=` (the minimum bytes the
+/// parser needs), never `==`: the real on-chain account is LARGER than this
+/// (≈4483 bytes vs 4451 here) due to trailing padding, so `==` would revert
+/// every legitimate oracle read and brick deposits/withdraws/swaps. `>=` passes
+/// on the real (and any future grown) account and only trips on a truncated one.
+pub const EXPECTED_OBS_MIN_LEN: usize = OBS_OBSERVATIONS_OFFSET + OBS_NUM * OBS_ENTRY_LEN;
+
+/// M-1 tripwire: assert the ObservationState account is at least as large as the
+/// layout the parser expects. Call at every oracle-read site BEFORE parsing.
+/// Fails loudly (`InvalidPriceFeed`) on a truncated/shrunk Raydium layout; never
+/// trips on a valid or grown account (uses `>=`). See EXPECTED_OBS_MIN_LEN.
+pub fn check_observation_layout(obs_data: &[u8]) -> Result<()> {
+    require!(obs_data.len() >= EXPECTED_OBS_MIN_LEN, VaultError::InvalidPriceFeed);
+    Ok(())
+}
+
 /// Valid tick bounds for Raydium CLMM (= Uniswap v3 bounds).
 pub const MIN_TICK: i32 = -443636;
 pub const MAX_TICK: i32 = 443636;
@@ -568,10 +591,11 @@ pub const MAX_SWAP_SLIPPAGE_BPS: u128 = 100;
 pub const SWAP_WINDOW_SECS: i64 = 3_600;
 
 /// Max swap volume per window as a fraction of treasury value, in bps.
-/// 10000 = 100% of treasury per hour (audit M-3, tightened from 15000/150%).
-/// Still covers two full one-sided 50/50 rebalances per hour, but cuts the
-/// worst-case self-sandwich drain to ≈1%/hr (cap × MAX_SWAP_SLIPPAGE_BPS).
-pub const MAX_SWAP_VOLUME_BPS: u128 = 10_000;
+/// 6000 = 60% of treasury per hour (audit M-2, tightened from 10000/100%).
+/// Still allows a single one-sided→50/50 rebalance (which needs to swap ≈50% of
+/// treasury), but cuts the worst-case self-sandwich drain by a compromised
+/// operator to ≈0.6%/hr (cap × MAX_SWAP_SLIPPAGE_BPS = 6000 bps × 100 bps).
+pub const MAX_SWAP_VOLUME_BPS: u128 = 6_000;
 
 /// Minimum seconds between two treasury swaps (audit M-3). A legitimate
 /// rebalance performs a single swap, so this never blocks normal operation;
@@ -1155,6 +1179,41 @@ mod math_tests {
         assert_eq!(reward_group_size(5, 2), None);
         // 7 accounts / 2 rewards → ragged → None.
         assert_eq!(reward_group_size(7, 2), None);
+    }
+
+    // ── M-2: swap volume cap tightened to 60%/window ──────────────────────────
+    #[test]
+    fn m2_swap_volume_cap_is_60pct() {
+        // Cap is 6000 bps = 60% of treasury per window.
+        assert_eq!(MAX_SWAP_VOLUME_BPS, 6_000);
+        // Worst-case operator bleed per window ≈ cap × slippage = 60% × 1% = 0.6%.
+        // Expressed in bps² / 10_000 → 0.6% = 60 bps.
+        let worst_case_bleed_bps = MAX_SWAP_VOLUME_BPS * MAX_SWAP_SLIPPAGE_BPS / 10_000;
+        assert_eq!(worst_case_bleed_bps, 60); // 0.6%
+        // Still allows a single one-sided→50/50 rebalance, which needs to swap ~50%
+        // (5000 bps) of the treasury: 5000 <= 6000.
+        assert!(5_000 <= MAX_SWAP_VOLUME_BPS);
+    }
+
+    // ── M-1: ObservationState layout tripwire ─────────────────────────────────
+    #[test]
+    fn m1_expected_obs_min_len_matches_parser() {
+        // Derived from the offset constants, never hardcoded.
+        assert_eq!(EXPECTED_OBS_MIN_LEN, OBS_OBSERVATIONS_OFFSET + OBS_NUM * OBS_ENTRY_LEN);
+        assert_eq!(EXPECTED_OBS_MIN_LEN, 4451); // 51 + 100*44
+    }
+
+    #[test]
+    fn m1_layout_check_uses_ge_not_eq() {
+        // A truncated account fails loudly.
+        let short = vec![0u8; EXPECTED_OBS_MIN_LEN - 1];
+        assert!(check_observation_layout(&short).is_err());
+        // Exactly the minimum passes.
+        let exact = vec![0u8; EXPECTED_OBS_MIN_LEN];
+        assert!(check_observation_layout(&exact).is_ok());
+        // The REAL on-chain account is larger (≈4483 bytes) → must NOT be bricked.
+        let real = vec![0u8; 4483];
+        assert!(check_observation_layout(&real).is_ok());
     }
 
     #[test]

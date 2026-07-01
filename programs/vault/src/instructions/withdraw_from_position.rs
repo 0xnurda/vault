@@ -13,7 +13,7 @@ use raydium_clmm_cpi::{
 use crate::constants::PROTOCOL_FEE_DENOMINATOR;
 use crate::errors::VaultError;
 use crate::events::WithdrawEvent;
-use crate::state::{check_price_not_manipulated, count_initialized_rewards, observation_pool_id, seeds, validate_reward_recipients, value_in_token1, UserDeposit, Vault, MAX_SQRT_DEVIATION_WITHDRAW_BPS};
+use crate::state::{check_observation_layout, check_price_not_manipulated, count_initialized_rewards, observation_pool_id, seeds, validate_reward_recipients, value_in_token1, UserDeposit, Vault, MAX_SQRT_DEVIATION_WITHDRAW_BPS};
 
 #[derive(Accounts)]
 pub struct WithdrawFromPosition<'info> {
@@ -28,11 +28,20 @@ pub struct WithdrawFromPosition<'info> {
     )]
     pub vault: Box<Account<'info, Vault>>,
 
+    // NEW-5: init_if_needed so a holder who received shares by SPL transfer (and
+    // thus has no UserDeposit PDA) can still withdraw — and cannot be frozen out
+    // when the vault is paused (deposits, which create this PDA, are blocked while
+    // paused). Canonical `bump` (a freshly-created zeroed account stores bump 0, so
+    // `bump = user_deposit.bump` would fail). The account-level owner constraint is
+    // removed (it would revert on the just-created zeroed account); authorization is
+    // enforced by the PDA seeds (bound to vault + user) and re-checked in the handler
+    // for pre-existing accounts.
     #[account(
-        mut,
+        init_if_needed,
+        payer = user,
+        space = UserDeposit::LEN,
         seeds = [seeds::USER_DEPOSIT, vault.key().as_ref(), user.key().as_ref()],
-        bump = user_deposit.bump,
-        constraint = user_deposit.user == user.key(),
+        bump,
     )]
     pub user_deposit: Box<Account<'info, UserDeposit>>,
 
@@ -123,6 +132,7 @@ pub struct WithdrawFromPosition<'info> {
     pub token_program: Program<'info, Token>,
     pub token_program_2022: Program<'info, Token2022>,
     pub memo_program: Program<'info, Memo>,
+    pub system_program: Program<'info, System>,
 }
 
 pub fn handler<'a, 'b, 'c: 'info, 'info>(
@@ -131,6 +141,26 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
     min_token1_out: u64,
 ) -> Result<()> {
     let remaining = ctx.remaining_accounts.to_vec();
+
+    // NEW-5: initialize a freshly-created UserDeposit (transferred-share holder who
+    // never deposited), or authorize a pre-existing one. Must run before any use of
+    // user_deposit. `created_at == 0` uniquely identifies a fresh (zeroed) account —
+    // every real deposit sets created_at to a non-zero timestamp.
+    {
+        let user_key = ctx.accounts.user.key();
+        let vault_key = ctx.accounts.vault.key();
+        let bump = ctx.bumps.user_deposit;
+        let now = Clock::get()?.unix_timestamp;
+        let ud = &mut ctx.accounts.user_deposit;
+        if ud.created_at == 0 {
+            ud.user = user_key;
+            ud.vault = vault_key;
+            ud.bump = bump;
+            ud.created_at = now;
+        } else {
+            require!(ud.user == user_key, VaultError::Unauthorized);
+        }
+    }
 
     // H-2: pause MUST NOT block withdrawals — only deposits. Deposited funds are
     // always redeemable; otherwise admin could freeze user funds forever.
@@ -145,6 +175,7 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
         let obs_ai = &ctx.accounts.observation_state;
         require!(obs_ai.owner == &raydium_clmm_cpi::id(), VaultError::InvalidPriceFeed);
         let obs_data = obs_ai.try_borrow_data()?;
+        check_observation_layout(&obs_data)?;
         require!(
             observation_pool_id(&obs_data) == Some(ctx.accounts.vault.pool_id),
             VaultError::InvalidPriceFeed

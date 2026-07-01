@@ -11,7 +11,7 @@ use raydium_clmm_cpi::{
 use crate::errors::VaultError;
 use crate::events::SwapEvent;
 use crate::state::{
-    reference_sqrt_price, seeds, swap_min_out_floor, value_in_token1,
+    check_observation_layout, reference_sqrt_price, seeds, swap_min_out_floor, value_in_token1,
     Vault, MAX_SWAP_VOLUME_BPS, SWAP_COOLDOWN_SECS, SWAP_WINDOW_SECS,
 };
 
@@ -137,6 +137,7 @@ pub fn handler<'a, 'b, 'c: 'info, 'info>(
         // (Borrow is scoped to this block and released before the swap CPI.)
         let ref_sqrt = {
             let obs_data = ctx.accounts.observation_state.try_borrow_data()?;
+            check_observation_layout(&obs_data)?;
             reference_sqrt_price(&obs_data).ok_or(error!(VaultError::OracleUnavailable))?
         };
 

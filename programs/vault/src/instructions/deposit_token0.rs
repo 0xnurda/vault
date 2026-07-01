@@ -6,7 +6,7 @@ use crate::constants::{DEAD_SHARES, MIN_FIRST_DEPOSIT_VALUE, PROTOCOL_FEE_DENOMI
 use crate::errors::VaultError;
 use crate::events::DepositToken0Event;
 use crate::state::{
-    calculate_position_amounts, check_price_not_manipulated, observation_pool_id,
+    calculate_position_amounts, check_observation_layout, check_price_not_manipulated, observation_pool_id,
     seeds, sqrt_price_to_price, UserDeposit, Vault, MAX_SQRT_DEVIATION_BPS,
 };
 
@@ -122,6 +122,7 @@ pub fn handler(ctx: Context<DepositToken0>, amount: u64, min_shares_out: u64) ->
         let obs_ai = &ctx.accounts.observation_state;
         require!(obs_ai.owner == &raydium_clmm_cpi::id(), VaultError::InvalidPriceFeed);
         let obs_data = obs_ai.try_borrow_data()?;
+        check_observation_layout(&obs_data)?;
         require!(
             observation_pool_id(&obs_data) == Some(vault.pool_id),
             VaultError::InvalidPriceFeed
