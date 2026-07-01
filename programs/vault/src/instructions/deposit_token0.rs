@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, MintTo, Token, TokenAccount, Transfer};
 use raydium_clmm_cpi::states::{PersonalPositionState, PoolState};
 
-use crate::constants::{DEAD_SHARES, MIN_FIRST_DEPOSIT_VALUE};
+use crate::constants::{DEAD_SHARES, MIN_FIRST_DEPOSIT_VALUE, PROTOCOL_FEE_DENOMINATOR};
 use crate::errors::VaultError;
 use crate::events::DepositToken0Event;
 use crate::state::{
@@ -148,14 +148,25 @@ pub fn handler(ctx: Context<DepositToken0>, amount: u64, min_shares_out: u64) ->
         let pos_data = ctx.accounts.personal_position.try_borrow_data()?;
         let pos = PersonalPositionState::try_deserialize(&mut &pos_data[..])?;
         drop(pos_data);
-        calculate_position_amounts(
+        let (principal0, principal1) = calculate_position_amounts(
             sqrt_price_x64,
             tick_current,
             pos.tick_lower_index,
             pos.tick_upper_index,
             pos.liquidity,
             token0_is_pool_token0,
-        )
+        );
+        // NEW-4: include the position's UNCOLLECTED fees in TVL so deposits price
+        // shares symmetrically with withdraw_from_position (which collects & pays
+        // them pro-rata). Otherwise a JIT depositor buys in cheap (fees excluded)
+        // then withdraws to capture a share of fees accrued before they joined.
+        // Use NET (after the 10% protocol cut — the same split withdraw applies),
+        // and map pool token order → vault token order.
+        let (fee_pool0, fee_pool1) = (pos.token_fees_owed_0, pos.token_fees_owed_1);
+        let net0 = fee_pool0.saturating_sub(fee_pool0 / PROTOCOL_FEE_DENOMINATOR);
+        let net1 = fee_pool1.saturating_sub(fee_pool1 / PROTOCOL_FEE_DENOMINATOR);
+        let (fee_v0, fee_v1) = if token0_is_pool_token0 { (net0, net1) } else { (net1, net0) };
+        (principal0.saturating_add(fee_v0), principal1.saturating_add(fee_v1))
     } else {
         (0u64, 0u64)
     };
